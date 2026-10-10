@@ -2,7 +2,53 @@
 
 نظام متكامل لإدارة العيادات والمواعيد والمرضى والفواتير، مع **صفحة حجز عامة** لكل عيادة. يعمل بسيرفر Node بدون أي اعتماديات خارجية (Zero dependencies) وواجهة عميل مبنية مسبقاً (Next.js static export).
 
-> 📸 **جولة مصوّرة في كل الشاشات (٣٠ صورة، بما فيها شاشات الطبيب والاستقبال):** [`docs/SCREENS.md`](docs/SCREENS.md)
+> 📸 **الشرح التفصيلي لكل شاشة:** [docs/SCREENS.md](docs/SCREENS.md)
+
+---
+
+## 🖼️ لقطات الشاشات
+
+### 🌐 الواجهة العامة
+
+| الصفحة التعريفية | تسجيل الدخول | حجز المريض |
+|:---:|:---:|:---:|
+| ![الرئيسية](docs/screenshots/01-landing.png) | ![الدخول](docs/screenshots/02-login.png) | ![الحجز](docs/screenshots/03-booking.png) |
+
+### 🖥️ لوحة التحكم (المالك)
+
+| لوحة التحكم | المرضى | المواعيد |
+|:---:|:---:|:---:|
+| ![لوحة التحكم](docs/screenshots/04-dashboard.png) | ![المرضى](docs/screenshots/05-patients.png) | ![المواعيد](docs/screenshots/06-appointments.png) |
+
+| السجلات الطبية | الفواتير | المخزون |
+|:---:|:---:|:---:|
+| ![السجلات](docs/screenshots/07-records.png) | ![الفواتير](docs/screenshots/08-invoices.png) | ![المخزون](docs/screenshots/09-inventory.png) |
+
+| الديون | بيع المنتجات | التقارير |
+|:---:|:---:|:---:|
+| ![الديون](docs/screenshots/10-debts.png) | ![بيع المنتجات](docs/screenshots/11-product-sales.png) | ![التقارير](docs/screenshots/12-reports.png) |
+
+| المهام | الإعدادات | إدارة العيادات |
+|:---:|:---:|:---:|
+| ![المهام](docs/screenshots/13-tasks.png) | ![الإعدادات](docs/screenshots/14-settings.png) | ![إدارة العيادات](docs/screenshots/15-management.png) |
+
+| الخدمات والأسعار | الأمان | الاشتراكات | العروض |
+|:---:|:---:|:---:|:---:|
+| ![الخدمات](docs/screenshots/16-services.png) | ![الأمان](docs/screenshots/17-security.png) | ![الاشتراكات](docs/screenshots/18-subscriptions.png) | ![العروض](docs/screenshots/19-offers.png) |
+
+### 👨‍⚕️ حساب الطبيب
+
+| لوحة التحكم | المرضى | المواعيد | السجلات | المهام |
+|:---:|:---:|:---:|:---:|:---:|
+| ![الطبيب](docs/screenshots/20-doctor-dashboard.png) | ![المرضى](docs/screenshots/21-doctor-patients.png) | ![المواعيد](docs/screenshots/22-doctor-appointments.png) | ![السجلات](docs/screenshots/23-doctor-records.png) | ![المهام](docs/screenshots/24-doctor-tasks.png) |
+
+### 💁 حساب الاستقبال
+
+| لوحة التحكم | المرضى | المواعيد | الفواتير | الديون | المهام |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| ![الاستقبال](docs/screenshots/25-reception-dashboard.png) | ![المرضى](docs/screenshots/26-reception-patients.png) | ![المواعيد](docs/screenshots/27-reception-appointments.png) | ![الفواتير](docs/screenshots/28-reception-invoices.png) | ![الديون](docs/screenshots/29-reception-debts.png) | ![المهام](docs/screenshots/30-reception-tasks.png) |
+
+> التفاصيل والشرح الكامل لكل شاشة في [docs/SCREENS.md](docs/SCREENS.md)
 
 ---
 
