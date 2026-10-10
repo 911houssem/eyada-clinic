@@ -8,13 +8,15 @@
 
 ## 🖼️ لقطات الشاشات
 
+> كل لقطات لوحة التحكم مأخوذة من حساب **مدير عيادة (صاحب عيادة)** على «عيادة النور للأسنان» مع بيانات حقيقية واشتراك فعّال — وليس من حساب مالك الموقع.
+
 ### 🌐 الواجهة العامة
 
 | الصفحة التعريفية | تسجيل الدخول | حجز المريض |
 |:---:|:---:|:---:|
 | ![الرئيسية](docs/screenshots/01-landing.png) | ![الدخول](docs/screenshots/02-login.png) | ![الحجز](docs/screenshots/03-booking.png) |
 
-### 🖥️ لوحة التحكم (المالك)
+### 🖥️ لوحة تحكم مدير العيادة
 
 | لوحة التحكم | المرضى | المواعيد |
 |:---:|:---:|:---:|
@@ -32,21 +34,9 @@
 |:---:|:---:|:---:|
 | ![المهام](docs/screenshots/13-tasks.png) | ![الإعدادات](docs/screenshots/14-settings.png) | ![إدارة العيادات](docs/screenshots/15-management.png) |
 
-| الخدمات والأسعار | الأمان | الاشتراكات | العروض |
-|:---:|:---:|:---:|:---:|
-| ![الخدمات](docs/screenshots/16-services.png) | ![الأمان](docs/screenshots/17-security.png) | ![الاشتراكات](docs/screenshots/18-subscriptions.png) | ![العروض](docs/screenshots/19-offers.png) |
-
-### 👨‍⚕️ حساب الطبيب
-
-| لوحة التحكم | المرضى | المواعيد | السجلات | المهام |
-|:---:|:---:|:---:|:---:|:---:|
-| ![الطبيب](docs/screenshots/20-doctor-dashboard.png) | ![المرضى](docs/screenshots/21-doctor-patients.png) | ![المواعيد](docs/screenshots/22-doctor-appointments.png) | ![السجلات](docs/screenshots/23-doctor-records.png) | ![المهام](docs/screenshots/24-doctor-tasks.png) |
-
-### 💁 حساب الاستقبال
-
-| لوحة التحكم | المرضى | المواعيد | الفواتير | الديون | المهام |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| ![الاستقبال](docs/screenshots/25-reception-dashboard.png) | ![المرضى](docs/screenshots/26-reception-patients.png) | ![المواعيد](docs/screenshots/27-reception-appointments.png) | ![الفواتير](docs/screenshots/28-reception-invoices.png) | ![الديون](docs/screenshots/29-reception-debts.png) | ![المهام](docs/screenshots/30-reception-tasks.png) |
+| الخدمات والأسعار | الأمان |
+|:---:|:---:|
+| ![الخدمات](docs/screenshots/16-services.png) | ![الأمان](docs/screenshots/17-security.png) |
 
 > التفاصيل والشرح الكامل لكل شاشة في [docs/SCREENS.md](docs/SCREENS.md)
 
