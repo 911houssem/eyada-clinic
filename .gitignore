@@ -1,0 +1,29 @@
+# runtime output
+*.log
+*.out
+*.err
+ui-out.txt
+ui-err.txt
+
+# artifacts written by the suites
+tools/booking-dom*.html
+tools/*-out.txt
+tools/*-err.txt
+
+# live database (holds account credentials + session tokens; the server seeds
+# demo data automatically on first run, so it is never committed)
+data/db.json
+
+# database snapshots taken by the flush/repair helpers
+data/*.tmp
+data/*.backup-*
+data/*.pre-purge-*
+
+# superseded bundle copies (the live one + .pre-ui8 baseline are kept)
+_next/static/chunks/*.orig
+_next/static/chunks/*.orig2
+
+# dependencies / os
+node_modules/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,2804 @@
+"use strict";
+/**
+ * نظام عيادة — Local hosting server (hardened)
+ * ============================================
+ * 1. Serves the mirrored static Next.js build from this folder.
+ * 2. Implements every /api/* endpoint the UI calls, so login / register
+ *    and the whole dashboard work offline.
+ *
+ * Zero dependencies. Data is persisted to data/db.json (atomic writes).
+ *
+ * Run:   node server.js
+ *        node server.js --port 4000
+ *        PORT=4000 node server.js
+ */
+
+const http = require("http");
+const fs = require("fs");
+const fsp = require("fs/promises");
+const path = require("path");
+const crypto = require("crypto");
+
+/* ══════════════════════════ 1. CONFIG ══════════════════════════ */
+
+const ROOT = __dirname;
+const DATA_DIR = path.join(ROOT, "data");
+const DB_FILE = path.join(DATA_DIR, "db.json");
+const TMP_FILE = path.join(DATA_DIR, "db.json.tmp");
+
+const argv = process.argv.slice(2);
+const argOf = (name) => {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
+};
+
+const HOST = process.env.HOST || "127.0.0.1";
+const PORT = Number(process.env.PORT || argOf("port") || 3000);
+const AUTO_PORT = process.env.AUTO_PORT === "1" || argv.includes("--auto-port");
+
+const LIMITS = {
+  bodyBytes: 5 * 1024 * 1024, // 5 MB
+  urlBytes: 16 * 1024, // 16 KB
+  maxConnections: 512,
+  headersTimeout: 20_000,
+  requestTimeout: 60_000,
+  keepAliveTimeout: 5_000,
+  sessionTtlMs: 30 * 24 * 60 * 60 * 1000, // 30 days
+  sessionSweepMs: 10 * 60 * 1000, // sweep every 10 minutes
+};
+
+/* ══════════════════════════ 2. LOGGING ══════════════════════════ */
+
+const started = Date.now();
+const stamp = () => new Date().toISOString().replace("T", " ").slice(0, 19);
+
+const log = (...a) => console.log(`[${stamp()}]`, ...a);
+const warn = (...a) => console.warn(`[${stamp()}] WARN`, ...a);
+const fail = (...a) => console.error(`[${stamp()}] ERROR`, ...a);
+
+/**
+ * Anything logged here also goes to data/server.log (size-capped).
+ * Synchronous on purpose: every caller is a fatal path that may call
+ * process.exit() immediately after, and an async stream would be cut off
+ * before it flushed. This is never on a hot path, so the cost is fine.
+ */
+function toFile(line) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const f = path.join(DATA_DIR, "server.log");
+    if (fs.existsSync(f) && fs.statSync(f).size > 2 * 1024 * 1024) fs.renameSync(f, f + ".1");
+    fs.appendFileSync(f, `${line}\n`);
+  } catch {
+    /* logging must never take the server down */
+  }
+}
+
+/* ══════════════════════════ 3. ERRORS ══════════════════════════ */
+
+class AppError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+    this.expected = true;
+  }
+}
+
+const badRequest = (m) => new AppError(400, m);
+const unauthorized = (m = "غير مصرح") => new AppError(401, m);
+const forbidden = (m = "غير مصرح") => new AppError(403, m);
+const notFound = (m = "غير موجود") => new AppError(404, m);
+
+/* ══════════════════════════ 4. UTILITIES ══════════════════════════ */
+
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".txt": "text/plain; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
+  ".webmanifest": "application/manifest+json",
+};
+
+const uid = (p = "id") => `${p}_${crypto.randomBytes(9).toString("hex")}`;
+const now = () => new Date().toISOString();
+const num = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+
+function hashPassword(pw) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(String(pw), salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(pw, stored) {
+  try {
+    const [salt, hash] = String(stored).split(":");
+    if (!salt || !hash) return false;
+    const test = crypto.scryptSync(String(pw), salt, 64);
+    const known = Buffer.from(hash, "hex");
+    return known.length === test.length && crypto.timingSafeEqual(known, test);
+  } catch {
+    return false;
+  }
+}
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw || typeof raw !== "string") return out;
+  for (const part of raw.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    try {
+      out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      /* ignore malformed cookie */
+    }
+  }
+  return out;
+}
+
+/** Never throws — returns {} for anything unusable. */
+function readBody(req) {
+  return new Promise((resolve) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > LIMITS.bodyBytes) {
+      req.resume();
+      return resolve({});
+    }
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > LIMITS.bodyBytes) {
+        chunks.length = 0;
+        req.destroy(); // frees the socket instead of buffering forever
+        return done({});
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      if (!raw.trim()) return done({});
+      try {
+        const parsed = JSON.parse(raw);
+        done(parsed && typeof parsed === "object" ? parsed : {});
+      } catch {
+        done({});
+      }
+    });
+    req.on("error", () => done({}));
+    req.on("aborted", () => done({}));
+  });
+}
+
+/**
+ * Single funnel for every response. Guarantees we never write twice and
+ * never touch a socket that is already gone.
+ */
+function respond(res, status, payload, headers = {}) {
+  if (res.writableEnded || res.destroyed) return false;
+
+  const body = typeof payload === "string" ? payload : JSON.stringify(payload);
+
+  if (res.headersSent) {
+    // Headers already flushed (e.g. mid-stream) — just close cleanly.
+    try { res.end(); } catch { /* socket gone */ }
+    return false;
+  }
+
+  const type =
+    typeof payload === "string"
+      ? headers["Content-Type"] || MIME[".txt"]
+      : MIME[".json"];
+
+  try {
+    res.writeHead(status, {
+      "Content-Type": type,
+      "Content-Length": Buffer.byteLength(body),
+      "Cache-Control": "no-store",
+      ...headers,
+    });
+    res.end(body);
+    return true;
+  } catch (e) {
+    warn("respond failed:", e.message);
+    try { res.end(); } catch { /* socket gone */ }
+    return false;
+  }
+}
+
+const json = (res, status, payload) => respond(res, status, payload);
+
+/* ══════════════════════════ 5. DATABASE ══════════════════════════ */
+
+const EMPTY = {
+  users: [], clinics: [], patients: [], appointments: [], invoices: [],
+  tasks: [], records: [], inventory: [], messages: [], services: [],
+  plans: [], clinicSubscriptions: [], offers: [], sessions: {},
+};
+
+/**
+ * The bookable menu every clinic starts with. `durationMin` is the single
+ * source of truth for how long a visit lasts: the owner edits it per service in
+ * settings, the public page shows it, and the slot grid steps by it.
+ */
+const DEFAULT_SERVICES = [
+  { name: "كشفية عامة", description: "زيارة طبيب أول مع مراجعة السجل الطبي", durationMin: 20, price: 150 },
+  { name: "استشارة متابعة", description: "متابعة العلاج بعد زيارة سابقة", durationMin: 20, price: 100 },
+  { name: "جلسة علاج", description: "جلسة علاج طبي مطولة", durationMin: 40, price: 250 },
+];
+
+/** Give a brand-new clinic its default bookable menu. */
+function seedDefaultServices(clinicId) {
+  for (const [i, s] of DEFAULT_SERVICES.entries()) {
+    db.services.push({
+      id: uid("svc"), clinicId, name: s.name, description: s.description,
+      durationMin: s.durationMin, price: s.price,
+      isActive: true, sortOrder: i, createdAt: now(),
+    });
+  }
+}
+
+const AR_MONTHS = ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"];
+
+function seed() {
+  const nowIso = now();
+  const clinicId = uid("clinic");
+
+  const plans = [
+    { id: uid("plan"), name: "الأساسية", description: "مثالية للعيادة الواحدة التي بدأت رحلتها",
+      price: 199, yearlyPrice: 1990, maxPatients: 500, maxDoctors: 2, maxClinics: 1,
+      isPopular: false, isActive: true, sortOrder: 0,
+      features: ["إدارة مواعيد غير محدودة","ملفات المرضى الأساسية","فواتير مع ضريبة ١٥٪","تذكيرات عبر الرسائل النصية","دعم عبر البريد الإلكتروني"] },
+    { id: uid("plan"), name: "الاحترافية", description: "الخيار الأكثر طلباً من أطباء العيادات النشطة",
+      price: 399, yearlyPrice: 3990, maxPatients: 2000, maxDoctors: 5, maxClinics: 1,
+      isPopular: true, isActive: true, sortOrder: 1,
+      features: ["كل مزايا الخطة الأساسية","سجل طبي كامل وتاريخ الزيارات","إدارة المخزون والأدوية","لوحة تحكم وتحليلات متقدمة","مهام وملاحظات الفريق","دعم ذو أولوية عبر المحادثة"] },
+    { id: uid("plan"), name: "المتقدمة", description: "للساسل الطبية والعيادات متعددة الفروع",
+      price: 799, yearlyPrice: 7990, maxPatients: 10000, maxDoctors: 20, maxClinics: 5,
+      isPopular: false, isActive: true, sortOrder: 2,
+      features: ["كل مزايا الخطة الاحترافية","إدارة متعددة العيادات","صلاحيات متقدمة لكل فرع","تقارير مالية مفصّلة","محادثة داخلية بين الفرق","مدير حساب مخصص"] },
+  ];
+
+  const mkUser = (username, password, fullName, phone, email, role) => ({
+    id: uid("user"), username, password: hashPassword(password), fullName,
+    phone, email, role, clinicId, twoFactorEnabled: false, trustedDevices: [], createdAt: nowIso,
+  });
+
+  const users = [
+    mkUser("admin", "admin123", "مالك العيادة", "0500000000", "admin@eyada.local", "super_admin"),
+    mkUser("doctor", "doctor123", "د. أحمد المنصور", "0500000001", "doctor@eyada.local", "doctor"),
+    mkUser("reception", "reception123", "أ. سارة العتيبي", "0500000002", "reception@eyada.local", "reception"),
+    // helpdesk — the only account a clinic may open a conversation with
+    { ...mkUser("support", "support123", "الدعم الفني", "0500000003", "support@eyada.local", "support"), clinicId: null },
+  ];
+
+  const clinics = [{
+    id: clinicId, name: "عيادة النور للأسنان", phone: "0500000000",
+    address: "الرياض — حي العليا", currency: "SAR",
+    paymentMode: "postpaid", ownerId: users[0].id, // the seeded admin IS the site owner
+    bookingSlug: "al-noor-clinic", bookingEnabled: true, createdAt: nowIso,
+  }];
+
+  const mkPatient = (fullName, gender, age, phone) => ({
+    id: uid("pat"), clinicId, fullName, gender, age, phone, email: "",
+    bloodType: "O+", allergies: "", createdAt: nowIso,
+  });
+
+  const patients = [
+    mkPatient("محمد أحمد", "male", 32, "0551111111"),
+    mkPatient("فاطمة سعد", "female", 27, "0552222222"),
+    mkPatient("عبدالله خالد", "male", 45, "0553333333"),
+    mkPatient("نورة العتيبي", "female", 38, "0554444444"),
+    mkPatient("سعد المطيري", "male", 51, "0555555555"),
+  ];
+
+  const base = new Date();
+  const at = (h, m) => { const d = new Date(base); d.setHours(h, m, 0, 0); return d.toISOString(); };
+  const mkAppt = (patientId, doctorId, h, m, title, type, status) => ({
+    id: uid("apt"), clinicId, patientId, doctorId, title, type,
+    startTime: at(h, m), endTime: at(h, m + 30), status, notes: "", createdAt: nowIso,
+  });
+
+  const appointments = [
+    mkAppt(patients[0].id, users[1].id, 9, 0, "كشف طبي", "consultation", "scheduled"),
+    mkAppt(patients[1].id, users[1].id, 10, 30, "تنظيف وتلميع", "regular", "scheduled"),
+    mkAppt(patients[2].id, users[1].id, 12, 0, "حشوة تجميلية", "regular", "scheduled"),
+    mkAppt(patients[3].id, users[1].id, 14, 30, "متابعة علاج", "follow_up", "scheduled"),
+  ];
+
+  const mkInvoice = (patientId, subtotal, tax, total, paid, status, method, item) => ({
+    id: uid("inv"), clinicId, patientId, subtotal, insuranceDiscount: 0,
+    taxPercentage: 15, taxAmount: tax, total, paidAmount: paid, dueAmount: total - paid,
+    status, paymentMethod: method,
+    items: [{ item_type: "service", item_name: item, unit_price: subtotal, quantity: 1 }],
+    createdAt: nowIso,
+  });
+
+  const invoices = [
+    mkInvoice(patients[0].id, 200, 30, 230, 230, "paid", "cash", "كشف طبي"),
+    mkInvoice(patients[1].id, 350, 52.5, 402.5, 200, "partial", "card", "تنظيف وتلميع"),
+  ];
+
+  const offers = [
+    { id: uid("offer"), title: "خصم البداية للعيادات الجديدة",
+      description: "خصم ٥٠٪ على أول ثلاثة أشهر عند الاشتراك في أي خطة سنوية.",
+      badge: "للعيادات الجديدة", discountType: "percentage", discountValue: 50,
+      startDate: nowIso, endDate: new Date(Date.now() + 60 * 864e5).toISOString(), isActive: true },
+    { id: uid("offer"), title: "وفّر شهرين مع الدفع السنوي",
+      description: "ادفع سنوياً واحصل على شهرين مجاناً في جميع الخطط.",
+      badge: "الأكثر طلباً", discountType: "fixed", discountValue: 400,
+      startDate: nowIso, endDate: new Date(Date.now() + 90 * 864e5).toISOString(), isActive: true },
+    { id: uid("offer"), title: "عرض السلاسل الطبية",
+      description: "خصم ٢٠٪ على كل فرع إضافي في خطة المتقدمة.",
+      badge: "للعيادات المتعددة", discountType: "percentage", discountValue: 20,
+      startDate: nowIso, endDate: new Date(Date.now() + 120 * 864e5).toISOString(), isActive: true },
+  ];
+
+  return {
+    ...EMPTY, users, clinics, patients, appointments, invoices, offers, plans,
+    tasks: [{
+      id: uid("task"), clinicId, title: "طلب مخزون التخدير",
+      description: "تنبيه للمورد باقتراب نفاد المخزون", assignedTo: ownerId,
+      priority: "high", status: "todo",
+      dueDate: new Date(Date.now() + 2 * 864e5).toISOString(), createdAt: nowIso,
+    }],
+    records: [],
+    inventory: [
+      { id: uid("inv_item"), clinicId, itemName: "مخدر ليدوكايين", itemNameEn: "Lidocaine",
+        category: "medication", quantity: 24, maxStock: 50, minStock: 10,
+        unitPrice: 35, cost: 20, supplier: "شركة الدواء", createdAt: nowIso },
+      { id: uid("inv_item"), clinicId, itemName: "قفازات نيتريل", itemNameEn: "Nitrile Gloves",
+        category: "supply", quantity: 120, maxStock: 200, minStock: 40,
+        unitPrice: 12, cost: 7, supplier: "شركة المعدات الطبية", createdAt: nowIso },
+    ],
+    messages: [],
+    clinicSubscriptions: [{
+      id: uid("cs"), clinicId, planId: plans[1].id, status: "active", startDate: nowIso,
+      endDate: new Date(Date.now() + 365 * 864e5).toISOString(), trialEndDate: null,
+      billingCycle: "monthly", notes: "",
+    }],
+    sessions: {},
+  };
+}
+
+/** Repairs anything missing/corrupt so one bad field can't break boot. */
+function normalize(raw) {
+  const db = { ...EMPTY, ...(raw && typeof raw === "object" ? raw : {}) };
+  for (const k of Object.keys(EMPTY)) {
+    if (k === "sessions") {
+      if (!db.sessions || typeof db.sessions !== "object" || Array.isArray(db.sessions)) db.sessions = {};
+    } else if (!Array.isArray(db[k])) {
+      db[k] = [];
+    }
+  }
+  return db;
+}
+
+function pruneSessions(db) {
+  const cutoff = Date.now() - LIMITS.sessionTtlMs;
+  let removed = 0;
+  for (const [token, s] of Object.entries(db.sessions)) {
+    if (!s || typeof s.userId !== "string" ||
+        (Date.parse(s.lastSeen || s.createdAt || 0) || 0) < cutoff) {
+      delete db.sessions[token];
+      removed++;
+    }
+  }
+  return removed;
+}
+
+let db;
+
+/**
+ * One-time repairs applied on every boot (idempotent).
+ *  - exactly one site owner (super_admin); everyone else who was auto-promoted
+ *    by an older register endpoint becomes a clinic owner (admin)
+ *  - "receptionist" -> "reception" (the only spelling the UI knows)
+ *  - clinics always have a bookingSlug / bookingEnabled flag
+ */
+function migrate() {
+  const notes = [];
+
+  for (const u of db.users) {
+    const role = normalizeRole(u.role);
+    if (!role) { u.role = "reception"; notes.push(`user ${u.username}: unknown role -> reception`); }
+    else if (role !== u.role) { notes.push(`user ${u.username}: ${u.role} -> ${role}`); u.role = role; }
+  }
+
+  const owners = db.users.filter((u) => u.role === "super_admin")
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  const siteOwner = owners[0] || null;
+  if (!siteOwner && db.users.length) {
+    const first = db.users.slice().sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")))[0];
+    first.role = "super_admin";
+    notes.push(`${first.username} promoted to site owner (no super_admin existed)`);
+  } else {
+    for (const u of owners.slice(1)) {
+      u.role = "admin";
+      notes.push(`${u.username} demoted super_admin -> admin (صاحب عيادة)`);
+    }
+  }
+
+  // clinics left behind by deleted accounts
+  const usedIn = (cid) =>
+    db.users.some((u) => u.clinicId === cid) ||
+    db.patients.some((x) => x.clinicId === cid) ||
+    db.appointments.some((x) => x.clinicId === cid) ||
+    db.invoices.some((x) => x.clinicId === cid) ||
+    db.tasks.some((x) => x.clinicId === cid) ||
+    db.records.some((x) => x.clinicId === cid) ||
+    db.inventory.some((x) => x.clinicId === cid);
+  // deliberately NOT db.services: migrate() seeds a default menu into every
+  // clinic, so counting services would make each clinic look "used" forever and
+  // an abandoned clinic could never be pruned
+
+  const orphans = db.clinics.filter((c) => !usedIn(c.id));
+  if (orphans.length) {
+    const dead = new Set(orphans.map((c) => c.id));
+    db.clinics = db.clinics.filter((c) => !dead.has(c.id));
+    db.clinicSubscriptions = db.clinicSubscriptions.filter((s) => !dead.has(s.clinicId));
+    db.services = db.services.filter((s) => !dead.has(s.clinicId));
+    notes.push(`removed ${orphans.length} empty clinic(s) with no owner or data`);
+  }
+
+  // services can outlive their clinic (older build, hand-edited db, a clinic
+  // pruned before this sweep existed) and would otherwise linger forever
+  const liveClinics = new Set(db.clinics.map((c) => c.id));
+  const stray = db.services.filter((s) => !liveClinics.has(s.clinicId)).length;
+  if (stray) {
+    db.services = db.services.filter((s) => liveClinics.has(s.clinicId));
+    notes.push(`dropped ${stray} service(s) belonging to a clinic that no longer exists`);
+  }
+
+  for (const c of db.clinics) {
+    if (c.ownerId && !db.users.some((u) => u.id === c.ownerId)) {
+      const heir = db.users.find((u) => u.clinicId === c.id);
+      if (heir) { c.ownerId = heir.id; notes.push(`clinic ${c.name}: ownerId -> ${heir.username}`); }
+      else if (siteOwner) { c.ownerId = siteOwner.id; notes.push(`clinic ${c.name}: ownerId -> ${siteOwner.username} (site owner)`); }
+      else c.ownerId = "";
+    }
+  }
+
+const SAFE_SLUG = /^[a-z0-9][a-z0-9-]*$/;
+  for (const c of db.clinics) {
+    // keep only URL-safe ASCII slugs (older ones may be Arabic -> percent-encoded links)
+    if (!c.bookingSlug || !SAFE_SLUG.test(c.bookingSlug) || db.clinics.filter((o) => o.bookingSlug === c.bookingSlug).length > 1) {
+      c.bookingSlug = uniqueBookingSlug(c.bookingSlug && SAFE_SLUG.test(c.bookingSlug) ? c.bookingSlug : c.name);
+      notes.push(`clinic ${c.name}: booking slug = ${c.bookingSlug}`);
+    }
+    if (c.bookingEnabled === undefined) c.bookingEnabled = true;
+    if (c.paymentMode === undefined) c.paymentMode = "postpaid";
+  }
+
+  // every bookable clinic needs at least one service, otherwise the public
+  // page has nothing to offer and the duration has no meaning
+  for (const c of db.clinics) {
+    if (!db.services.some((s) => s.clinicId === c.id)) {
+      seedDefaultServices(c.id);
+      notes.push(`clinic ${c.name}: seeded ${DEFAULT_SERVICES.length} default service(s)`);
+    }
+  }
+
+  // every account needs an explicit role and a permission grant
+  for (const u of db.users) {
+    const role = normalizeRole(u.role);
+    if (!role) {
+      u.role = "reception";
+      notes.push(`${u.username}: unknown role -> reception`);
+    } else if (role !== u.role) {
+      notes.push(`${u.username}: role ${u.role} -> ${role}`);
+      u.role = role;
+    }
+    if (!u.permissions || typeof u.permissions !== "object") {
+      u.permissions = {};
+      notes.push(`${u.username}: permissions initialised for ${u.role}`);
+    }
+  }
+
+  // clinics need a helpdesk account to talk to
+  if (!db.users.some((u) => u.role === "support")) {
+    db.users.push({
+      id: uid("user"), username: "support", password: hashPassword("support123"),
+      fullName: "الدعم الفني", phone: "", email: "support@eyada.local",
+      role: "support", clinicId: null, permissions: {},
+      twoFactorEnabled: false, trustedDevices: [], createdAt: now(),
+    });
+    notes.push("created support account (support / support123)");
+  }
+
+  return notes;
+}
+
+function load() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const raw = fs.readFileSync(DB_FILE, "utf8");
+      db = normalize(JSON.parse(raw));
+      const notes = migrate();
+      const n = pruneSessions(db);
+      if (n) log(`pruned ${n} expired session(s) on boot`);
+      if (notes.length) { for (const line of notes) log(`migrated: ${line}`); save(true); }
+      log(`database loaded — ${db.users.length} users, ${db.patients.length} patients, ${Object.keys(db.sessions).length} sessions`);
+      return;
+    }
+  } catch (e) {
+    fail("db.json unreadable, reseeding:", e.message);
+    try { fs.renameSync(DB_FILE, `${DB_FILE}.corrupt-${Date.now()}`); } catch { /* best effort */ }
+  }
+  db = normalize(seed());
+  migrate();
+  save(true);
+  log("database seeded with demo data");
+}
+
+/** Debounced + atomic (write to .tmp then rename) so a crash mid-write can't corrupt it. */
+let saveTimer = null;
+let saving = false;
+let saveAgain = false;
+
+function save(immediate = false) {
+  if (immediate) return flush();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flush, 80);
+  if (saveTimer.unref) saveTimer.unref();
+  return undefined;
+}
+
+async function flush() {
+  if (saving) { saveAgain = true; return; }
+  saving = true;
+  let handle = null;
+  try {
+    await fsp.mkdir(DATA_DIR, { recursive: true });
+    handle = await fsp.open(TMP_FILE, "w");
+    await handle.writeFile(JSON.stringify(db, null, 2), "utf8");
+    await handle.sync(); // flush to disk before the rename, so a power cut can't leave a renamed-but-empty file
+    await handle.close();
+    handle = null;
+    await fsp.rename(TMP_FILE, DB_FILE); // atomic on Windows + POSIX
+  } catch (e) {
+    fail("could not persist database:", e.message);
+  } finally {
+    if (handle) { try { await handle.close(); } catch { /* already closed */ } }
+    saving = false;
+    if (saveAgain) { saveAgain = false; save(); }
+  }
+}
+
+/* ══════════════════════════ 6. SESSIONS ══════════════════════════ */
+
+const SESSION_COOKIE = "eyada_session";
+
+function cookieHeader(token) {
+  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`;
+}
+
+function createSession(res, userId, impersonatorId = null) {
+  const token = crypto.randomBytes(32).toString("hex");
+  db.sessions[token] = { userId, impersonatorId, createdAt: now(), lastSeen: now() };
+  save();
+  const cookies = [cookieHeader(token)];
+  if (impersonatorId) {
+    const owner = db.users.find((u) => u.id === impersonatorId);
+    cookies.push(
+      `impersonator_name=${encodeURIComponent(owner ? owner.fullName : "المالك")}; Path=/; SameSite=Lax; Max-Age=86400`
+    );
+  } else {
+    cookies.push("impersonator_name=; Path=/; SameSite=Lax; Max-Age=0");
+  }
+  appendCookies(res, cookies);
+  return token;
+}
+
+function appendCookies(res, cookies) {
+  if (res.headersSent) return;
+  const existing = res.getHeader("Set-Cookie");
+  const all = [].concat(existing || [], cookies);
+  try { res.setHeader("Set-Cookie", all); } catch { /* headers already out */ }
+}
+
+function clearSession(req, res) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (token && db.sessions[token]) {
+    delete db.sessions[token];
+    save();
+  }
+  appendCookies(res, [
+    `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
+    "impersonator_name=; Path=/; SameSite=Lax; Max-Age=0",
+  ]);
+}
+
+function currentSession(req) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (!token) return null;
+  const s = db.sessions[token];
+  if (!s) return null;
+  const user = db.users.find((u) => u.id === s.userId);
+  if (!user) return null;
+  s.lastSeen = now(); // cheap; flushed by the debounced save
+  return { token, user, impersonatorId: s.impersonatorId || null };
+}
+
+function requireSession(req) {
+  const s = currentSession(req);
+  if (!s) throw unauthorized();
+  return s;
+}
+
+function requireSuperAdmin(req) {
+  const s = requireSession(req);
+  if (s.user.role !== "super_admin") throw forbidden("هذا الإجراء متاح لمالك الموقع فقط");
+  return s;
+}
+
+/**
+ * Clinic owner = "admin" (صاحب عيادة). Site owner = "super_admin" (مالك الموقع).
+ * A clinic owner may run their own clinic and staff; only the site owner gets
+ * platform-wide powers (impersonation, global plans/offers, full backup).
+ */
+function requireClinicOwner(req) {
+  const s = requireSession(req);
+  if (s.user.role !== "super_admin" && s.user.role !== "admin")
+    throw forbidden("هذا الإجراء متاح لصاحب العيادة أو مالك الموقع فقط");
+  return s;
+}
+
+const isSiteOwner = (u) => !!u && u.role === "super_admin";
+
+/** Clinics this user is allowed to touch. */
+function ownedClinicIds(user) {
+  if (isSiteOwner(user)) return db.clinics.map((c) => c.id);
+  const ids = new Set();
+  if (user.clinicId) ids.add(user.clinicId);
+  for (const c of db.clinics) if (c.ownerId === user.id) ids.add(c.id);
+  return [...ids];
+}
+
+/* ── ROLES & PERMISSIONS ──
+ * The compiled UI already hides sidebar items with `user.permissions[key]`, and
+ * the keys are fixed there, so the catalog below must keep those exact names.
+ * A clinic owner grants these to the staff they hire, per user, via
+ * PUT /api/users {id, permissions}. super_admin (site owner) and support are
+ * platform roles and cannot be granted by a clinic owner.
+ */
+const ROLES = ["super_admin", "support", "admin", "doctor", "reception", "accountant", "nurse"];
+/** Roles a clinic owner is allowed to hand out to their own staff. */
+const GRANTABLE_ROLES = ["doctor", "reception", "accountant", "nurse"];
+const ROLE_LABELS = {
+  super_admin: "مالك الموقع",
+  support: "الدعم",
+  admin: "صاحب عيادة",
+  doctor: "طبيب",
+  reception: "استقبال",
+  accountant: "محاسب",
+  nurse: "تمريض",
+};
+
+const PERMISSIONS = [
+  { key: "dashboard", label: "لوحة التحكم", group: "عام", hint: "عرض لوحة المؤشرات والإحصائيات" },
+  { key: "patients", label: "المرضى", group: "العيادة", hint: "إضافة وتعديل ملفات المرضى" },
+  { key: "appointments", label: "المواعيد", group: "العيادة", hint: "حجز وتعديل وإلغاء المواعيد" },
+  { key: "records", label: "السجلات الطبية", group: "العيادة", hint: "الاطلاع على السجل الطبي والتشخيصات" },
+  { key: "invoices", label: "الفواتير", group: "المالية", hint: "إنشاء الفواتير والتحصيل والديون" },
+  { key: "inventory", label: "المخزون", group: "المالية", hint: "الأدوية والمواد وبيع المنتجات" },
+  { key: "reports", label: "التقارير", group: "المالية", hint: "التقارير والتحليلات المالية" },
+  { key: "settings", label: "الإعدادات", group: "الإدارة", hint: "إعدادات العيادة وإدارة الموظفين" },
+];
+const PERMISSION_KEYS = PERMISSIONS.map((p) => p.key);
+
+const NO_PERMISSIONS = Object.fromEntries(PERMISSION_KEYS.map((k) => [k, false]));
+const ALL_PERMISSIONS = Object.fromEntries(PERMISSION_KEYS.map((k) => [k, true]));
+
+/** Default grant per role. Anything the owner sets on the user wins. */
+const ROLE_PERMISSIONS = {
+  super_admin: { ...ALL_PERMISSIONS },
+  // support works the tickets, not the clinic: no clinical/financial access,
+  // just enough of the shell to sign in and open the conversation inbox
+  support: { ...NO_PERMISSIONS, dashboard: true },
+  // clinic owner (صاحب عيادة)
+  admin: { ...ALL_PERMISSIONS },
+  doctor: { dashboard: true, patients: true, appointments: true, records: true, invoices: false, inventory: false, reports: false, settings: false },
+  reception: { dashboard: true, patients: true, appointments: true, records: false, invoices: true, inventory: false, reports: false, settings: false },
+  accountant: { dashboard: true, patients: false, appointments: false, records: false, invoices: true, inventory: true, reports: true, settings: false },
+  nurse: { dashboard: true, patients: true, appointments: true, records: true, invoices: false, inventory: false, reports: false, settings: false },
+};
+
+/** Historic alias used by older data and the default in POST /api/users. */
+const normalizeRole = (r) => {
+  if (r === "receptionist") return "reception";
+  if (r === "manager" || r === "owner") return "admin";
+  if (r === "superadmin") return "super_admin";
+  return ROLES.includes(r) ? r : null;
+};
+
+const isSupport = (u) => !!u && u.role === "support";
+
+/** Role defaults merged with the owner's explicit per-user grants. */
+function effectivePermissions(user) {
+  if (!user) return { ...NO_PERMISSIONS };
+  if (user.role === "super_admin") return { ...ALL_PERMISSIONS };
+  const base = { ...(ROLE_PERMISSIONS[user.role] || NO_PERMISSIONS) };
+  const own = user.permissions && typeof user.permissions === "object" ? user.permissions : {};
+  for (const k of PERMISSION_KEYS) {
+    if (own[k] === true || own[k] === false) base[k] = own[k];
+    else delete own[k];
+  }
+  // The owner can switch a whole section off from the subscriptions screen (the
+  // permission-style picker). It beats both the role default and the per-user
+  // grant: the section is gone for every member of that clinic. The same map
+  // drives enforcePermission (API) and publicUser().permissions (sidebar), so
+  // the menu item disappears and the endpoint refuses the call.
+  if (user.clinicId && !isSiteOwner(user)) {
+    const live = accessSubscription(user.clinicId);
+    const off = live && live.modules;
+    if (off) for (const k of PERMISSION_KEYS) if (off[k] === false) base[k] = false;
+  }
+  return base;
+}
+
+/** Keeps only known module keys with `false` values: absent always means on. */
+function sanitizeModules(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+  const out = {};
+  for (const k of PERMISSION_KEYS) if (v[k] === false) out[k] = false;
+  return out;
+}
+
+const can = (user, key) => !!user && effectivePermissions(user)[key] === true;
+
+/** Throws unless the session's user holds `key`. */
+function requirePerm(req, key) {
+  const s = requireSession(req);
+  if (!can(s.user, key)) throw forbidden("ليست لديك صلاحية: " + (PERMISSIONS.find((p) => p.key === key) || {}).label);
+  return s;
+}
+
+/**
+ * Central permission gate, applied to every /api route before its handler runs.
+ * Read routes need the "view" side of a module, write routes need full access to
+ * it. Roles the owner hands out therefore decide what a member of staff can see
+ * in the sidebar AND what the API will actually accept.
+ */
+const PERMISSION_RULES = [
+  { rx: /^\/api\/dashboard/, key: "dashboard" },
+  { rx: /^\/api\/patients/, key: "patients" },
+  { rx: /^\/api\/appointments/, key: "appointments" },
+  { rx: /^\/api\/records/, key: "records" },
+  { rx: /^\/api\/(invoices|debts)/, key: "invoices" },
+  { rx: /^\/api\/(inventory|product-sales)/, key: "inventory" },
+  { rx: /^\/api\/reports/, key: "reports" },
+  // tasks are shared by the whole clinic team, so there is no permission key for
+  // them: every member who works in a clinic may read/write them and the handlers
+  // scope by clinicId. Support works the ticket inbox, not a clinic, so it is
+  // kept out here as well as in the sidebar.
+  { rx: /^\/api\/tasks/, key: null, denyRoles: ["support"] },
+  // the bookable menu (price + duration) is a clinic setting: everyone in the
+  // clinic may read it so the app can show it, but changing it needs settings
+  { rx: /^\/api\/services/, key: "settings", methods: ["POST", "PUT", "DELETE"] },
+  // reading the clinic list is already narrowed to the caller's own clinics by
+  // the handler, so every signed-in member may read it; changing a clinic needs
+  // the "settings" grant
+  { rx: /^\/api\/clinics/, key: "settings", methods: ["POST", "PUT", "DELETE"] },
+  { rx: /^\/api\/(users|roles)/, key: "settings" },
+];
+
+/* ══════════════════════════ SUBSCRIPTION GATE ══════════════════════════
+ * What a clinic may still do once its trial ran out or its plan expired.
+ * The rule the owner asked for: nothing works except talking to support, so
+ * the app never looks broken — it looks paused, with a way out.
+ * Read-only paths (session, chat, its own subscription) stay open on purpose.
+ */
+const OPEN_WHEN_LOCKED = [
+  /^\/api\/auth\//,          // login, logout, me, change-password
+  /^\/api\/chat/,            // the one thing a locked clinic may still do
+  /^\/api\/subscriptions$/,  // read the plans on offer
+  /^\/api\/clinic-subscriptions$/, // read its own subscription state
+  /^\/api\/offers$/,         // public offers
+  /^\/api\/clinics$/,        // read its own clinic record (the GET branch)
+  /^\/api\/public\//,        // the public booking page must keep working
+  /^\/api\/dashboard\/health$/,
+];
+
+// reading these is fine so the app can still show prices/durations, but writing
+// them is real work and must stay behind the paywall
+const READ_ONLY_WHEN_LOCKED = [/^\/api\/services$/];
+
+/**
+ * A clinic is locked out when it has no live subscription. The site owner and
+ * the support desk are never clinic-scoped, so they are unaffected.
+ */
+function enforceSubscription(req, urlPath) {
+  if (urlPath.startsWith("/api/public/")) return;
+  if (OPEN_WHEN_LOCKED.some((rx) => rx.test(urlPath))) return;
+  if (req.method === "GET" && READ_ONLY_WHEN_LOCKED.some((rx) => rx.test(urlPath))) return;
+
+  const s = currentSession(req);
+  if (!s) return;                       // unauthenticated: the route decides
+  const user = s.user;
+  if (isSiteOwner(user) || user.role === "support") return;
+  if (!user.clinicId) return;            // not attached to a clinic
+
+  if (!accessSubscription(user.clinicId)) {
+    throw new AppError(402,
+      "انتهت الفترة التجريبية أو اشتراك العيادة. يمكنك التواصل مع الدعم فقط حتى يتم تفعيل الاشتراك.");
+  }
+}
+
+function enforcePermission(req, urlPath) {
+  const rule = PERMISSION_RULES.find(
+    (r) => r.rx.test(urlPath) && (!r.methods || r.methods.includes(req.method))
+  );
+  if (!rule) return; // auth, chat, plans, backup, public booking ... handled in-handler
+  const s = requireSession(req);
+  if (rule.denyRoles && rule.denyRoles.includes(s.user.role))
+    throw forbidden("ليست لديك صلاحية: المهام");
+  if (!rule.key) return;
+  if (!can(s.user, rule.key))
+    throw forbidden("ليست لديك صلاحية: " + (PERMISSIONS.find((p) => p.key === rule.key) || {}).label);
+}
+
+/* ── SUBSCRIPTIONS ──
+ * A trial clinic gets exactly the same features as a paying one. The single
+ * exception the owner asked for: hiring staff needs a real (paid) subscription.
+ */
+const TRIAL_HOURS = 1;
+
+/** Subscription that currently grants access: paid or still inside its trial. */
+function accessSubscription(clinicId) {
+  if (!clinicId) return null;
+  const t = Date.now();
+  const live = db.clinicSubscriptions.filter(
+    (s) =>
+      s.clinicId === clinicId &&
+      (s.status === "active" || s.status === "trial") &&
+      (!s.endDate || new Date(s.endDate).getTime() > t)
+  );
+  // a paid plan always wins over the trial row the registration left behind,
+  // otherwise hiring would stay blocked after the clinic actually paid
+  return live.find((s) => s.status === "active") || live[0] || null;
+}
+
+/** Subscription state of a clinic, for /api/auth/me and the UI banner. */
+function subscriptionState(clinicId) {
+  const sub = accessSubscription(clinicId);
+  if (!sub) return { status: "none", canUse: false, canHire: false, endDate: null, trialEndDate: null, planId: null };
+  const paid = sub.status === "active";
+  return {
+    id: sub.id,
+    planId: sub.planId,
+    status: sub.status,
+    canUse: true,
+    canHire: paid,
+    endDate: sub.endDate || null,
+    trialEndDate: sub.trialEndDate || null,
+  };
+}
+
+/**
+ * Gate for staff management (hiring / editing / removing employees).
+ * Trial and expired clinics may use the whole app, but may not hire.
+ */
+function requireHiringSubscription(req) {
+  const s = requireClinicOwner(req);
+  if (isSiteOwner(s.user)) return s;
+  const sub = accessSubscription(s.user.clinicId);
+  if (!sub)
+    throw new AppError(402, "لا يوجد اشتراك فعال لهذه العيادة — التوظيف يتطلب اشتراكاً.تواصل مع الدعم");
+  if (sub.status !== "active")
+    throw new AppError(402, "التوظيف داخل العيادة متاح بعد الاشتراك فقط — الفترة التجريبية تسمح بكل الصلاحيات الأخرى");
+  return s;
+}
+
+/**
+ * URL-safe ASCII public booking slug, unique across clinics.
+ * Arabic-only names fall back to clinic-<id> so the link stays easy to
+ * copy/paste without percent-encoding surprises. Owner can rename it later
+ * via PUT /api/clinics {bookingSlug}.
+ */
+function uniqueBookingSlug(name) {
+  const taken = new Set(db.clinics.map((c) => c.bookingSlug).filter(Boolean));
+  const base =
+    String(name || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .replace(/-{2,}/g, "-")
+      .slice(0, 32)
+      .replace(/-+$/, "") || `clinic-${crypto.randomBytes(3).toString("hex")}`;
+  let slug = base;
+  for (let i = 2; taken.has(slug); i++) slug = `${base}-${i}`;
+  return slug;
+}
+
+const publicUser = (u) => {
+  if (!u) return null;
+  const { password, trustedDevices, permissions, ...rest } = u;
+  return {
+    ...rest,
+    roleLabel: ROLE_LABELS[u.role] || u.role,
+    // the UI reads user.permissions[key] to decide what to show
+    permissions: effectivePermissions(u),
+    subscription: subscriptionState(u.clinicId),
+    // the workspace swaps itself for a support-only screen when this is true
+    locked: !!u.clinicId && !subscriptionState(u.clinicId).canUse,
+    twoFactorEnabled: !!u.twoFactorEnabled,
+  };
+};
+
+/* ══════════════════════════ 7. DOMAIN HELPERS ══════════════════════════ */
+
+const patientOf = (id) => db.patients.find((p) => p.id === id) || null;
+const userOf = (id) => db.users.find((u) => u.id === id) || null;
+const clinicOf = (id) => db.clinics.find((c) => c.id === id) || null;
+
+function decorateAppointment(a) {
+  const p = patientOf(a.patientId);
+  const d = userOf(a.doctorId);
+  return {
+    ...a,
+    patient: p ? { id: p.id, fullName: p.fullName, phone: p.phone } : null,
+    doctor: d ? { id: d.id, fullName: d.fullName, role: d.role } : null,
+  };
+}
+
+function decorateInvoice(i) {
+  const p = patientOf(i.patientId);
+  return {
+    ...i,
+    items: Array.isArray(i.items) ? i.items : [],
+    patient: p ? { id: p.id, fullName: p.fullName, phone: p.phone } : null,
+  };
+}
+
+const sameDay = (iso, d) => {
+  if (!iso) return false;
+  const x = new Date(iso);
+  return x.getFullYear() === d.getFullYear() && x.getMonth() === d.getMonth() && x.getDate() === d.getDate();
+};
+
+const clinicScope = (req, url) => {
+  const requested = url.searchParams.get("clinicId");
+  const session = currentSession(req);
+  const mine = session ? session.user.clinicId : null;
+  const id = requested || mine;
+  return id && clinicOf(id) ? id : mine;
+};
+
+function buildDashboard(clinicId, empty) {
+  // support has no clinic of its own: never fall back to somebody else's numbers
+  const clinic = empty ? null : clinicOf(clinicId) || db.clinics[0];
+  const cid = clinic ? clinic.id : null;
+
+  const patients = db.patients.filter((p) => p.clinicId === cid);
+  const appts = db.appointments.filter((a) => a.clinicId === cid);
+  const invoices = db.invoices.filter((i) => i.clinicId === cid);
+
+  const today = new Date();
+  const todayAppointments = appts
+    .filter((a) => sameDay(a.startTime, today))
+    .sort((a, b) => String(a.startTime).localeCompare(String(b.startTime)))
+    .map(decorateAppointment);
+
+  const revenueChart = [];
+  for (let k = 5; k >= 0; k--) {
+    const d = new Date(today.getFullYear(), today.getMonth() - k, 1);
+    revenueChart.push({
+      name: AR_MONTHS[d.getMonth()],
+      revenue: invoices.filter((i) => {
+        const x = new Date(i.createdAt || Date.now());
+        return x.getFullYear() === d.getFullYear() && x.getMonth() === d.getMonth();
+      }).reduce((s, i) => s + num(i.total), 0),
+    });
+  }
+
+  const statusLabels = { scheduled: "مجدول", completed: "تم", cancelled: "ملغي" };
+  const male = patients.filter((p) => p.gender === "male").length;
+  const female = patients.filter((p) => p.gender === "female").length;
+
+  return {
+    clinic: clinic || null,
+    stats: {
+      totalPatients: patients.length,
+      todayAppointments: todayAppointments.length,
+      totalRevenue: invoices.reduce((s, i) => s + num(i.total), 0),
+      totalCollected: invoices.reduce((s, i) => s + num(i.paidAmount), 0),
+      totalInvoices: invoices.length,
+      totalPending: invoices.reduce((s, i) => s + num(i.dueAmount), 0),
+    },
+    todayAppointments,
+    revenueChart,
+    appointmentStats: Object.entries(statusLabels).map(([k, label]) => ({
+      name: label, count: appts.filter((a) => a.status === k).length,
+    })),
+    patientStats: [
+      { name: "ذكور", value: male },
+      { name: "إناث", value: female },
+      { name: "غير محدد", value: patients.length - male - female },
+    ],
+    recentPatients: patients.slice(-5).reverse(),
+    upcomingAppointments: todayAppointments.filter((a) => a.status === "scheduled"),
+  };
+}
+
+/* ══════════════════════════ 8. ROUTES ══════════════════════════ */
+
+const routes = [];
+const PER_PAGE = 10;
+
+function route(method, pattern, handler) {
+  const keys = [];
+  const source = pattern.replace(/:([A-Za-z0-9_]+)/g, (_, k) => {
+    keys.push(k);
+    return "([^/]+)";
+  });
+  routes.push({ method, rx: new RegExp(`^${source}$`), keys, handler });
+}
+
+/* ── AUTH ── */
+
+route("POST", "/api/auth/register", async (req, res) => {
+  const b = await readBody(req);
+  const username = String(b.username || "").trim();
+  const password = String(b.password || "");
+  const fullName = String(b.fullName || "").trim();
+  const clinicName = String(b.clinicName || "").trim();
+
+  if (!username || !password || !fullName) throw badRequest("جميع الحقول مطلوبة");
+  if (!clinicName) throw badRequest("اسم العيادة مطلوب");
+  if (username.length < 3) throw badRequest("اسم المستخدم يجب أن يكون ٣ أحرف على الأقل");
+  if (password.length < 6) throw badRequest("كلمة المرور يجب أن تكون ٦ أحرف على الأقل");
+  if (db.users.some((u) => String(u.username).toLowerCase() === username.toLowerCase()))
+    throw new AppError(409, "اسم المستخدم مستخدم بالفعل");
+
+  const clinicId = uid("clinic");
+  const userId = uid("user");
+  const bookingSlug = uniqueBookingSlug(clinicName);
+
+  db.clinics.push({
+    id: clinicId, name: clinicName, phone: b.clinicPhone || "",
+    address: b.clinicAddress || "", currency: b.clinicCurrency || "SAR",
+    paymentMode: "postpaid", ownerId: userId,
+    bookingSlug, bookingEnabled: true, createdAt: now(),
+  });
+  seedDefaultServices(clinicId);
+
+  db.users.push({
+    id: userId, username, password: hashPassword(password), fullName,
+    phone: b.phone || "", email: b.email || "",
+    // صاحب عيادة — not مالك الموقع. super_admin stays reserved for the site owner.
+    role: "admin", clinicId,
+    twoFactorEnabled: false, trustedDevices: [], createdAt: now(),
+  });
+
+  const free = db.plans.filter((p) => p.isActive).sort((a, c) => a.sortOrder - c.sortOrder)[0];
+  if (free) {
+    // trial = 1 hour, and it grants everything except hiring (see TRIAL_HOURS)
+    const trialEnd = new Date(Date.now() + TRIAL_HOURS * 36e5).toISOString();
+    db.clinicSubscriptions.push({
+      id: uid("cs"), clinicId, planId: free.id, status: "trial",
+      startDate: now(), endDate: trialEnd, trialEndDate: trialEnd,
+      billingCycle: "monthly", notes: `فترة تجريبية ${TRIAL_HOURS} ساعة — كل الصلاحيات عدا التوظيف`,
+    });
+  }
+
+  const user = db.users.find((u) => u.id === userId);
+  createSession(res, userId);
+  save();
+  json(res, 200, { user: publicUser(user), currentClinicId: clinicId });
+});
+
+route("POST", "/api/auth/login", async (req, res) => {
+  const b = await readBody(req);
+  const username = String(b.username || "").trim();
+  const password = String(b.password || "");
+
+  const user = db.users.find((u) => String(u.username).toLowerCase() === username.toLowerCase());
+  // scrypt on a missing user too, so timing doesn't reveal which usernames exist
+  const okPw = user
+    ? verifyPassword(password, user.password)
+    : (verifyPassword(password, hashPassword("dummy")), false);
+
+  if (!user || !okPw) throw new AppError(401, "اسم المستخدم أو كلمة المرور غير صحيحة");
+
+  if (user.twoFactorEnabled && !b.trustDevice) {
+    if (!b.twoFactorCode) return json(res, 200, { requiresTwoFactor: true, userId: user.id });
+    if (String(b.twoFactorCode) !== "123456") throw new AppError(401, "رمز التحقق غير صحيح");
+  }
+
+  if (!user.twoFactorEnabled && b.trustDevice) {
+    if (!b.twoFactorCode)
+      return json(res, 200, {
+        requiresDeviceAuth: true, userId: user.id,
+        deviceName: b.deviceName || "جهاز جديد", _demoAuthCode: "123456",
+      });
+    if (String(b.twoFactorCode) !== "123456") throw new AppError(401, "رمز التحقق غير صحيح");
+  }
+
+  createSession(res, user.id);
+  json(res, 200, { user: publicUser(user), currentClinicId: user.clinicId });
+});
+
+route("GET", "/api/auth/me", async (req, res) => {
+  const s = requireSession(req);
+  // canUse, not the object itself: subscriptionState() always returns a shape,
+  // so a truthiness check here would never mark a clinic as locked
+  const sub = s.user.clinicId ? subscriptionState(s.user.clinicId) : null;
+  json(res, 200, {
+    user: publicUser(s.user),
+    currentClinicId: s.user.clinicId,
+    // the client uses this to swap the whole workspace for the "talk to
+    // support" screen instead of letting every list fail with a 402
+    subscription: sub,
+    locked: !!s.user.clinicId && !(sub && sub.canUse),
+  });
+});
+
+route("POST", "/api/auth/logout", async (req, res) => {
+  clearSession(req, res);
+  json(res, 200, { success: true });
+});
+
+route("POST", "/api/auth/change-password", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const next = String(b.newPassword || "");
+  if (next.length < 6)
+    throw badRequest("كلمة المرور الجديدة يجب أن تكون 6 أحرف على الأقل");
+  if (!verifyPassword(String(b.currentPassword || ""), s.user.password))
+    throw badRequest("كلمة المرور الحالية غير صحيحة");
+  if (verifyPassword(next, s.user.password))
+    throw badRequest("كلمة المرور الجديدة مطابقة للحالية");
+
+  s.user.password = hashPassword(next);
+  // every other device has to sign in again with the new password
+  for (const [token, sess] of Object.entries(db.sessions))
+    if (sess.userId === s.user.id && token !== s.token) delete db.sessions[token];
+  save();
+  json(res, 200, { success: true });
+});
+
+route("POST", "/api/auth/impersonate", async (req, res) => {
+  const s = requireSuperAdmin(req);
+  const b = await readBody(req);
+  const target = db.users.find((u) => u.id === b.userId);
+  if (!target) throw notFound("المستخدم غير موجود");
+
+  db.sessions[s.token].impersonatorId = s.user.id;
+  save();
+  appendCookies(res, [
+    cookieHeader(s.token),
+    `impersonator_name=${encodeURIComponent(s.user.fullName)}; Path=/; SameSite=Lax; Max-Age=86400`,
+  ]);
+  json(res, 200, {
+    user: publicUser(target), currentClinicId: target.clinicId, impersonatorName: s.user.fullName,
+  });
+});
+
+route("DELETE", "/api/auth/impersonate", async (req, res) => {
+  const s = requireSession(req);
+  if (!s.impersonatorId) throw badRequest("لا يوجد وضع انتحال نشط");
+
+  const owner = userOf(s.impersonatorId);
+  db.sessions[s.token].impersonatorId = null;
+  save();
+  appendCookies(res, [cookieHeader(s.token), "impersonator_name=; Path=/; SameSite=Lax; Max-Age=0"]);
+  json(res, 200, {
+    user: publicUser(owner), currentClinicId: owner ? owner.clinicId : null,
+  });
+});
+
+/* ── HEALTH ── */
+
+route("GET", "/api/health", async (req, res) => {
+  json(res, 200, {
+    status: "ok",
+    uptimeSec: Math.round((Date.now() - started) / 1000),
+    sessions: Object.keys(db.sessions).length,
+    memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+    node: process.version,
+  });
+});
+
+/* ── CLINICS ── */
+
+route("GET", "/api/clinics", async (req, res, p, url) => {
+  const s = requireSession(req);
+  const ids = new Set(ownedClinicIds(s.user));
+  const list = db.clinics.filter((c) => ids.has(c.id));
+
+  const id = url.searchParams.get("id");
+  if (id) {
+    const found = list.find((c) => c.id === id);
+    if (!found) throw notFound("العيادة غير موجودة");
+    return json(res, 200, { clinic: found, ...found });
+  }
+  json(res, 200, list);
+});
+
+route("POST", "/api/clinics", async (req, res) => {
+  const s = requireClinicOwner(req);
+  const b = await readBody(req);
+  if (!b.name) throw badRequest("اسم العيادة مطلوب");
+  const clinic = {
+    id: uid("clinic"), name: b.name, phone: b.phone || "", address: b.address || "",
+    currency: b.currency || "SAR",
+    paymentMode: b.paymentMode || "postpaid",
+    ownerId: s.user.id, bookingSlug: uniqueBookingSlug(b.name),
+    bookingEnabled: b.bookingEnabled !== false, createdAt: now(),
+  };
+  db.clinics.push(clinic);
+  seedDefaultServices(clinic.id);
+  save();
+  json(res, 200, clinic);
+});
+
+route("PUT", "/api/clinics", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const clinic = clinicOf(b.id);
+  if (!clinic) throw notFound("العيادة غير موجودة");
+  if (!isSiteOwner(s.user) && !new Set(ownedClinicIds(s.user)).has(clinic.id))
+    throw forbidden("لا يمكنك تعديل عيادة أخرى");
+  for (const k of ["name", "phone", "address", "currency", "paymentMode"])
+    if (b[k] !== undefined) clinic[k] = b[k];
+  // slotDuration is gone: appointment length is decided per service
+  if (b.bookingEnabled !== undefined) clinic.bookingEnabled = !!b.bookingEnabled;
+  if (b.bookingSlug !== undefined) {
+    const wanted = String(b.bookingSlug || "").trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (wanted) {
+      const clash = db.clinics.some((c) => c.id !== clinic.id && c.bookingSlug === wanted);
+      if (clash) throw new AppError(409, "هذا الرابط محجوز، اختر رابطاً آخر");
+      clinic.bookingSlug = wanted;
+    }
+  }
+  if (!clinic.bookingSlug) clinic.bookingSlug = uniqueBookingSlug(clinic.name);
+  save();
+  json(res, 200, clinic);
+});
+
+/* ── DASHBOARD ── */
+
+route("GET", "/api/dashboard", async (req, res, p, url) => {
+  const s = requireSession(req);
+  if (isSupport(s.user)) return json(res, 200, buildDashboard(null, true));
+  json(res, 200, buildDashboard(url.searchParams.get("clinicId") || s.user.clinicId));
+});
+
+/* ── PATIENTS ── */
+
+route("GET", "/api/patients", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  const search = (url.searchParams.get("search") || "").trim();
+  const page = num(url.searchParams.get("page"), 1);
+
+  let list = db.patients.filter((x) => x.clinicId === clinicId);
+  if (search) {
+    const q = search.toLowerCase();
+    list = list.filter(
+      (x) => String(x.fullName || "").toLowerCase().includes(q) || String(x.phone || "").includes(q)
+    );
+  }
+  list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+
+  const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+  const start = (Math.max(1, page) - 1) * PER_PAGE;
+  json(res, 200, { patients: list.slice(start, start + PER_PAGE), pages });
+});
+
+const PATIENT_FIELDS = ["fullName", "phone", "email", "gender", "age", "bloodType",
+  "allergies", "insuranceNumber", "insuranceCompany", "notes"];
+
+route("POST", "/api/patients", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (!String(b.fullName || "").trim()) throw badRequest("يرجى إدخال اسم المريض");
+  const patient = {
+    id: uid("pat"), clinicId: b.clinicId || s.user.clinicId, fullName: b.fullName,
+    phone: b.phone || "", email: b.email || "", gender: b.gender || "",
+    age: b.age === "" || b.age == null ? "" : num(b.age),
+    bloodType: b.bloodType || "", allergies: b.allergies || "",
+    insuranceNumber: b.insuranceNumber || "", insuranceCompany: b.insuranceCompany || "",
+    notes: b.notes || "", createdAt: now(),
+  };
+  db.patients.push(patient);
+  save();
+  json(res, 200, patient);
+});
+
+route("PUT", "/api/patients", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const patient = db.patients.find((x) => x.id === b.id);
+  if (!patient) throw notFound("المريض غير موجود");
+  for (const k of PATIENT_FIELDS) if (b[k] !== undefined) patient[k] = b[k];
+  save();
+  json(res, 200, patient);
+});
+
+route("DELETE", "/api/patients", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const i = db.patients.findIndex((x) => x.id === b.id);
+  if (i < 0) throw notFound("المريض غير موجود");
+  db.patients.splice(i, 1);
+  db.records = db.records.filter((r) => r.patientId !== b.id);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── APPOINTMENTS ── */
+
+/**
+ * Half-open overlap test: [start, end) vs [start, end). Two appointments may sit
+ * back to back (10:00-10:20 and 10:20-10:40) but never inside each other.
+ * Only same-clinic, same-doctor, still-live appointments count.
+ */
+function appointmentClashes(clinicId, doctorId, startMs, endMs, ignoreId) {
+  return db.appointments.some((a) => {
+    if (a.id === ignoreId) return false;
+    if (a.clinicId !== clinicId) return false;
+    if (String(a.status) === "cancelled" || String(a.status) === "canceled") return false;
+    if (doctorId && a.doctorId !== doctorId) return false;
+    const s = new Date(a.startTime).getTime();
+    if (!Number.isFinite(s)) return false;
+    const e = a.endTime ? new Date(a.endTime).getTime() : s;
+    return startMs < e && s < endMs;
+  });
+}
+
+route("GET", "/api/appointments", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  const date = url.searchParams.get("date");
+  let list = db.appointments.filter((a) => a.clinicId === clinicId);
+  if (date) {
+    const d = new Date(date);
+    if (!Number.isNaN(d.getTime())) list = list.filter((a) => sameDay(a.startTime, d));
+  }
+  list.sort((a, b) => String(a.startTime).localeCompare(String(b.startTime)));
+  json(res, 200, list.map(decorateAppointment));
+});
+
+route("POST", "/api/appointments", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const clinicId = b.clinicId || s.user.clinicId;
+  const clinic = clinicOf(clinicId) || {};
+
+  const start = b.startTime ? new Date(b.startTime) : new Date();
+  if (Number.isNaN(start.getTime())) throw badRequest("تاريخ الموعد غير صالح");
+  // the service decides how long the visit is; only a bare enquiry falls back
+  const svc = b.serviceId ? db.services.find((x) => x.id === b.serviceId && x.clinicId === clinicId) : null;
+  const durationMin = Math.max(5, num(b.duration, svc ? serviceDuration(svc) : DEFAULT_APPTMENT_MIN)
+    || (svc ? serviceDuration(svc) : DEFAULT_APPTMENT_MIN));
+  const end = new Date(start.getTime() + durationMin * 60000);
+
+  if (appointmentClashes(clinicId, b.doctorId || "", start.getTime(), end.getTime()))
+    throw new AppError(409, "هذا الوقت يتعارض مع موعد موجود للطبيب نفسه");
+
+  const appt = {
+    id: uid("apt"), clinicId, patientId: b.patientId || "", doctorId: b.doctorId || "",
+    title: b.title || "كشف طبي", type: b.type || "consultation",
+    serviceId: b.serviceId || "",
+    startTime: start.toISOString(), endTime: end.toISOString(),
+    status: b.status || "scheduled", notes: b.notes || "", createdAt: now(),
+  };
+  db.appointments.push(appt);
+  save();
+  json(res, 200, decorateAppointment(appt));
+});
+
+route("PUT", "/api/appointments", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const appt = db.appointments.find((a) => a.id === b.id);
+  if (!appt) throw notFound("الموعد غير موجود");
+  const EDITABLE = ["patientId", "doctorId", "title", "type", "status", "notes", "startTime", "endTime"];
+  const prev = {};
+  for (const k of EDITABLE) prev[k] = appt[k];
+  for (const k of EDITABLE) if (b[k] !== undefined) appt[k] = b[k];
+
+  // re-check after the move, otherwise dragging an appointment on top of
+  // another one silently double-books the doctor
+  const s = new Date(appt.startTime).getTime();
+  const e = new Date(appt.endTime).getTime();
+  if (Number.isFinite(s) && Number.isFinite(e) &&
+      appointmentClashes(appt.clinicId, appt.doctorId, s, e, appt.id)) {
+    for (const k of EDITABLE) appt[k] = prev[k];
+    throw new AppError(409, "هذا الوقت يتعارض مع موعد موجود للطبيب نفسه");
+  }
+
+  save();
+  json(res, 200, decorateAppointment(appt));
+});
+
+route("DELETE", "/api/appointments", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const i = db.appointments.findIndex((a) => a.id === b.id);
+  if (i < 0) throw notFound("الموعد غير موجود");
+  db.appointments.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── INVOICES ── */
+
+route("GET", "/api/invoices", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  const status = url.searchParams.get("status");
+  let list = db.invoices.filter((i) => i.clinicId === clinicId);
+  if (status) list = list.filter((i) => i.status === status);
+  list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  json(res, 200, { invoices: list.map(decorateInvoice) });
+});
+
+route("POST", "/api/invoices", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const subtotal = num(b.subtotal);
+  const taxPercentage = num(b.taxPercentage);
+  const taxAmount = num(b.taxAmount, (subtotal * taxPercentage) / 100);
+  const total = num(b.total, subtotal + taxAmount);
+  const paidAmount = num(b.paidAmount);
+
+  const invoice = {
+    id: uid("inv"), clinicId: b.clinicId || s.user.clinicId, patientId: b.patientId || "",
+    subtotal, insuranceDiscount: num(b.insuranceDiscount), taxPercentage, taxAmount, total,
+    paidAmount, dueAmount: total - paidAmount,
+    status: b.status || (total - paidAmount > 0 ? "pending" : "paid"),
+    paymentMethod: b.paymentMethod || "cash",
+    items: Array.isArray(b.items) ? b.items : [], createdAt: now(),
+  };
+  db.invoices.push(invoice);
+  save();
+  json(res, 200, decorateInvoice(invoice));
+});
+
+route("PUT", "/api/invoices", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const invoice = db.invoices.find((i) => i.id === b.id);
+  if (!invoice) throw notFound("الفاتورة غير موجودة");
+  for (const k of ["paidAmount", "status", "paymentMethod", "items"])
+    if (b[k] !== undefined) invoice[k] = b[k];
+  if (b.paidAmount !== undefined) {
+    invoice.dueAmount = num(invoice.total) - num(invoice.paidAmount);
+    invoice.status = invoice.dueAmount <= 0 ? "paid" : invoice.paidAmount > 0 ? "partial" : "pending";
+  }
+  save();
+  json(res, 200, decorateInvoice(invoice));
+});
+
+route("DELETE", "/api/invoices", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const i = db.invoices.findIndex((x) => x.id === b.id);
+  if (i < 0) throw notFound("الفاتورة غير موجودة");
+  db.invoices.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── USERS ── */
+
+route("GET", "/api/users", async (req, res) => {
+  const s = requireSession(req);
+  const ids = new Set(ownedClinicIds(s.user));
+  const list = isSiteOwner(s.user)
+    ? db.users
+    : db.users.filter((u) => ids.has(u.clinicId) || u.id === s.user.id);
+  json(res, 200, list.map(publicUser));
+});
+
+route("POST", "/api/users", async (req, res) => {
+  // hiring is the one thing a trial clinic may not do
+  const s = requireHiringSubscription(req);
+  const b = await readBody(req);
+  const username = String(b.username || "").trim();
+  const password = String(b.password || "");
+  if (!username || !b.fullName) throw badRequest("اسم المستخدم والاسم الكامل مطلوبان");
+  if (password.length < 6) throw badRequest("كلمة المرور يجب أن تكون ٦ أحرف على الأقل");
+  if (db.users.some((u) => String(u.username).toLowerCase() === username.toLowerCase()))
+    throw new AppError(409, "اسم المستخدم مستخدم بالفعل");
+
+  const role = normalizeRole(b.role) || "reception";
+  if (!isSiteOwner(s.user) && !GRANTABLE_ROLES.includes(role))
+    throw forbidden("لا يمكنك منح هذه الرتبة — الرتب المتاحة للموظفين: " + GRANTABLE_ROLES.map((r) => ROLE_LABELS[r]).join("، "));
+
+  // a clinic owner can only staff their own clinic
+  const ids = new Set(ownedClinicIds(s.user));
+  const clinicId = isSiteOwner(s.user) && b.clinicId ? b.clinicId : s.user.clinicId;
+  if (!isSiteOwner(s.user) && b.clinicId && !ids.has(b.clinicId))
+    throw forbidden("لا يمكنك إضافة موظفين لعيادة أخرى");
+
+  const user = {
+    id: uid("user"), username, password: hashPassword(password), fullName: b.fullName,
+    phone: b.phone || "", email: b.email || "", role, clinicId,
+    // start from the role defaults; the owner may narrow or widen them below
+    permissions: sanitizePermissions(b.permissions, role),
+    twoFactorEnabled: false, trustedDevices: [], createdAt: now(),
+  };
+  db.users.push(user);
+  save();
+  json(res, 200, publicUser(user));
+});
+
+/** Keep only real permission keys with boolean values. */
+function sanitizePermissions(input, role) {
+  const out = {};
+  if (!input || typeof input !== "object") return out;
+  for (const k of PERMISSION_KEYS) {
+    if (input[k] === true || input[k] === false) out[k] = input[k];
+  }
+  return out;
+}
+
+route("PUT", "/api/users", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const user = db.users.find((u) => u.id === b.id);
+  if (!user) throw notFound("المستخدم غير موجود");
+
+  const isSelf = user.id === s.user.id;
+  const managesStaff = !isSelf;
+  // editing someone else's account is staff management -> needs a paid subscription
+  if (managesStaff && !isSiteOwner(s.user)) {
+    requireHiringSubscription(req);
+    if (s.user.role !== "admin")
+      throw forbidden("تعديل الموظفين متاح لصاحب العيادة أو مالك الموقع فقط");
+  }
+
+  let roleChanged = false;
+  if (b.role !== undefined) {
+    const role = normalizeRole(b.role);
+    if (!role) throw badRequest("رتبة غير معروفة");
+    if (!isSiteOwner(s.user) && !GRANTABLE_ROLES.includes(role))
+      throw forbidden("لا يمكنك منح هذه الرتبة — الرتب المتاحة: " + GRANTABLE_ROLES.map((r) => ROLE_LABELS[r]).join("، "));
+    roleChanged = user.role !== role;
+    user.role = role;
+    // a new rank means a new baseline: drop the previous explicit grants so the
+    // role defaults apply, unless the owner sent a fresh permission set below
+    if (roleChanged && b.permissions === undefined) user.permissions = {};
+  }
+  if (b.permissions !== undefined) {
+    if (!isSiteOwner(s.user) && s.user.role !== "admin")
+      throw forbidden("منح الصلاحيات متاح لصاحب العيادة فقط");
+    user.permissions = sanitizePermissions(b.permissions, user.role);
+  }
+  if (b.clinicId !== undefined && !isSiteOwner(s.user)) {
+    if (!new Set(ownedClinicIds(s.user)).has(b.clinicId))
+      throw forbidden("لا يمكنك نقل مستخدم إلى عيادة أخرى");
+    user.clinicId = b.clinicId;
+  }
+  for (const k of ["fullName", "phone", "email", "twoFactorEnabled"])
+    if (b[k] !== undefined) user[k] = b[k];
+  if (b.password) {
+    if (String(b.password).length < 6) throw badRequest("كلمة المرور يجب أن تكون ٦ أحرف على الأقل");
+    user.password = hashPassword(b.password);
+  }
+  save();
+  json(res, 200, publicUser(user));
+});
+
+route("DELETE", "/api/users", async (req, res) => {
+  const s = requireHiringSubscription(req);
+  const b = await readBody(req);
+  if (b.id === s.user.id) throw badRequest("لا يمكنك حذف حسابك الحالي");
+  const i = db.users.findIndex((u) => u.id === b.id);
+  if (i < 0) throw notFound("المستخدم غير موجود");
+  if (!isSiteOwner(s.user) && !new Set(ownedClinicIds(s.user)).has(db.users[i].clinicId))
+    throw forbidden("لا يمكنك حذف مستخدم من عيادة أخرى");
+  db.users.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── ROLE & PERMISSION CATALOG (drives the owner's staff-permission UI) ── */
+
+/** Who a locked clinic should talk to. Open on purpose: it is the one thing a
+ *  clinic without a subscription is still allowed to do. */
+route("GET", "/api/chat/support", async (req, res) => {
+  requireSession(req);
+  const helpdesk = db.users.find(isSupport);
+  json(res, 200, {
+    support: helpdesk ? { id: helpdesk.id, fullName: helpdesk.fullName, email: helpdesk.email } : null,
+    ownerEmail: "911houssem@gmail.com",
+  });
+});
+
+route("GET", "/api/roles", async (req, res) => {
+  const s = requireSession(req);
+  const siteOwner = isSiteOwner(s.user);
+  json(res, 200, {
+    permissions: PERMISSIONS,
+    roles: Object.keys(ROLE_LABELS).map((id) => ({
+      id,
+      label: ROLE_LABELS[id],
+      grantable: siteOwner || GRANTABLE_ROLES.includes(id),
+      permissions: { ...(ROLE_PERMISSIONS[id] || NO_PERMISSIONS) },
+    })),
+    // what the caller itself may hand out
+    grantableRoles: siteOwner ? ROLES : GRANTABLE_ROLES,
+  });
+});
+
+/* ── RECORDS ── */
+
+route("GET", "/api/records", async (req, res, p, url) => {
+  requireSession(req);
+  const patientId = url.searchParams.get("patientId");
+  const clinicId = clinicScope(req, url);
+
+  const list = db.records
+    .filter((r) => {
+      if (patientId) return r.patientId === patientId;
+      const pt = patientOf(r.patientId);
+      return !clinicId || (pt && pt.clinicId === clinicId);
+    })
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+    .map((r) => {
+      const d = userOf(r.doctorId);
+      return { ...r, doctor: d ? { id: d.id, fullName: d.fullName } : null };
+    });
+
+  json(res, 200, list);
+});
+
+route("POST", "/api/records", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (!b.patientId) throw badRequest("المريض مطلوب");
+  const record = {
+    id: uid("rec"), patientId: b.patientId, doctorId: b.doctorId || s.user.id,
+    chiefComplaint: b.chiefComplaint || "", diagnosis: b.diagnosis || "",
+    treatment: b.treatment || "", notes: b.notes || "", createdAt: now(),
+  };
+  db.records.push(record);
+  save();
+  json(res, 200, record);
+});
+
+route("PUT", "/api/records", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const r = db.records.find((x) => x.id === b.id);
+  if (!r) throw notFound("السجل غير موجود");
+  for (const k of ["chiefComplaint", "diagnosis", "treatment", "notes"]) if (b[k] !== undefined) r[k] = b[k];
+  save();
+  json(res, 200, r);
+});
+
+route("DELETE", "/api/records", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const i = db.records.findIndex((x) => x.id === b.id);
+  if (i < 0) throw notFound("السجل غير موجود");
+  db.records.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── TASKS ── */
+
+/* ── TASKS ──
+ * Clinic-wide: every member of staff sees the same list. The handlers below
+ * pin each task to the caller's own clinic so nobody can inject or edit a task
+ * belonging to a clinic they do not work for.
+ */
+
+const clinicOfTask = (user, task) =>
+  isSiteOwner(user) ||
+  task.clinicId === user.clinicId ||
+  new Set(ownedClinicIds(user)).has(task.clinicId);
+
+route("GET", "/api/tasks", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  const status = url.searchParams.get("status");
+  let list = db.tasks.filter((t) => t.clinicId === clinicId);
+  if (status) list = list.filter((t) => t.status === status);
+  list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  json(res, 200, list);
+});
+
+/** Name list for pickers: who works here, with no credentials attached. */
+route("GET", "/api/staff", async (req, res) => {
+  const s = requireSession(req);
+  const ids = new Set(ownedClinicIds(s.user));
+  const list = db.users
+    .filter((u) => ids.has(u.clinicId))
+    .map((u) => ({ id: u.id, fullName: u.fullName, role: u.role, clinicId: u.clinicId }));
+  json(res, 200, list);
+});
+
+route("POST", "/api/tasks", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (!b.title) throw badRequest("عنوان المهمة مطلوب");
+  const wanted = b.clinicId || s.user.clinicId;
+  const clinicId = wanted && (isSiteOwner(s.user) || new Set(ownedClinicIds(s.user)).has(wanted))
+    ? wanted : s.user.clinicId;
+  if (!clinicId) throw forbidden("لا توجد عيادة مرتبطة بحسابك");
+  const task = {
+    id: uid("task"), clinicId, title: b.title,
+    description: b.description || "", assignedTo: b.assignedTo || "",
+    priority: b.priority || "medium", status: b.status || "todo",
+    dueDate: b.dueDate || "", createdAt: now(),
+  };
+  db.tasks.push(task);
+  save();
+  json(res, 200, task);
+});
+
+route("PUT", "/api/tasks", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const task = db.tasks.find((t) => t.id === b.id);
+  if (!task) throw notFound("المهمة غير موجودة");
+  if (!clinicOfTask(s.user, task)) throw forbidden("هذه المهمة تخص عيادة أخرى");
+  for (const k of ["title", "description", "assignedTo", "priority", "status", "dueDate"])
+    if (b[k] !== undefined) task[k] = b[k];
+  save();
+  json(res, 200, task);
+});
+
+route("DELETE", "/api/tasks", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const i = db.tasks.findIndex((t) => t.id === b.id);
+  if (i < 0) throw notFound("المهمة غير موجودة");
+  if (!clinicOfTask(s.user, db.tasks[i])) throw forbidden("هذه المهمة تخص عيادة أخرى");
+  db.tasks.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── SERVICES (the bookable menu: name + price + duration) ── */
+
+/** Resolve the caller's clinic for a service write, mirroring the tasks rules. */
+function serviceClinicId(user, wanted) {
+  const clinicId = wanted || user.clinicId;
+  if (!clinicId) throw forbidden("لا توجد عيادة مرتبطة بحسابك");
+  if (!isSiteOwner(user) && !new Set(ownedClinicIds(user)).has(clinicId))
+    throw forbidden("هذه الخدمة تخص عيادة أخرى");
+  return clinicId;
+}
+
+/**
+ * How long a service takes, in minutes. The owner sets this per service and the
+ * number is authoritative: a 1 minute consultation stays 1 minute and a 45
+ * minute treatment stays 45 — it is only clamped to a sane 1–10000 minute range.
+ * The booking grid is unaffected: slot starts still chain in `dur` steps (never
+ * finer than 15 minutes, see bookingSlots) so the day stays tidy.
+ */
+const DEFAULT_APPTMENT_MIN = 15;
+
+function serviceDuration(service) {
+  const wanted = num(service && service.durationMin, DEFAULT_APPTMENT_MIN);
+  return Math.max(1, Math.min(10000, Math.round(wanted) || DEFAULT_APPTMENT_MIN));
+}
+
+route("GET", "/api/services", async (req, res, p, url) => {
+  const s = requireSession(req);
+  const ids = new Set(ownedClinicIds(s.user));
+  let list = db.services.filter((x) => ids.has(x.clinicId));
+  if (url.searchParams.get("all") !== "true") list = list.filter((x) => x.isActive !== false);
+  json(res, 200, list.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)));
+});
+
+route("POST", "/api/services", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (!b.name) throw badRequest("اسم الخدمة مطلوب");
+  const clinicId = serviceClinicId(s.user, b.clinicId);
+  const service = {
+    id: uid("svc"), clinicId, name: String(b.name).slice(0, 120),
+    description: String(b.description || "").slice(0, 300),
+    durationMin: serviceDuration(b),
+    price: Math.max(0, num(b.price, 0)),
+    isActive: b.isActive !== false,
+    sortOrder: num(b.sortOrder, db.services.filter((x) => x.clinicId === clinicId).length),
+    createdAt: now(),
+  };
+  db.services.push(service);
+  save();
+  json(res, 200, service);
+});
+
+route("PUT", "/api/services", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const service = db.services.find((x) => x.id === b.id);
+  if (!service) throw notFound("الخدمة غير موجودة");
+  serviceClinicId(s.user, service.clinicId);
+  if (b.name !== undefined) service.name = String(b.name).slice(0, 120);
+  if (b.description !== undefined) service.description = String(b.description).slice(0, 300);
+  if (b.durationMin !== undefined) service.durationMin = serviceDuration(b);
+  if (b.price !== undefined) service.price = Math.max(0, num(b.price, 0));
+  if (b.isActive !== undefined) service.isActive = !!b.isActive;
+  if (b.sortOrder !== undefined) service.sortOrder = num(b.sortOrder, service.sortOrder || 0);
+  save();
+  json(res, 200, service);
+});
+
+route("DELETE", "/api/services", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const i = db.services.findIndex((x) => x.id === b.id);
+  if (i < 0) throw notFound("الخدمة غير موجودة");
+  serviceClinicId(s.user, db.services[i].clinicId);
+  db.services.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── INVENTORY ── */
+
+route("GET", "/api/inventory", async (req, res, p, url) => {
+  requireSession(req);
+  json(res, 200, db.inventory.filter((i) => i.clinicId === clinicScope(req, url)));
+});
+
+const INV_NUMERIC = new Set(["quantity", "maxStock", "minStock", "unitPrice", "cost"]);
+
+route("POST", "/api/inventory", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (!b.itemName) throw badRequest("اسم الصنف مطلوب");
+  const item = {
+    id: uid("inv_item"), clinicId: b.clinicId || s.user.clinicId, itemName: b.itemName,
+    itemNameEn: b.itemNameEn || "", category: b.category || "supply",
+    quantity: num(b.quantity), maxStock: num(b.maxStock), minStock: num(b.minStock),
+    unitPrice: num(b.unitPrice), cost: num(b.cost), supplier: b.supplier || "", createdAt: now(),
+  };
+  db.inventory.push(item);
+  save();
+  json(res, 200, item);
+});
+
+route("PUT", "/api/inventory", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const item = db.inventory.find((i) => i.id === b.id);
+  if (!item) throw notFound("الصنف غير موجود");
+  for (const k of ["itemName", "itemNameEn", "category", "quantity", "maxStock",
+    "minStock", "unitPrice", "cost", "supplier"]) {
+    if (b[k] !== undefined) item[k] = INV_NUMERIC.has(k) ? num(b[k]) : b[k];
+  }
+  save();
+  json(res, 200, item);
+});
+
+route("DELETE", "/api/inventory", async (req, res) => {
+  requireSession(req);
+  const b = await readBody(req);
+  const i = db.inventory.findIndex((x) => x.id === b.id);
+  if (i < 0) throw notFound("الصنف غير موجود");
+  db.inventory.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── CHAT ──
+ * A clinic (owner or staff) may only open a conversation with SUPPORT — the
+ * "تواصل مع المالك" button is for reaching the helpdesk, not the site owner.
+ * The site owner and support agents themselves can talk to anybody, because
+ * support has to be able to answer the clinics.
+ */
+function chatPartners(user) {
+  if (isSiteOwner(user) || isSupport(user)) return db.users;
+  return db.users.filter((u) => isSupport(u));
+}
+
+function assertCanMessage(sender, receiverId) {
+  // "support" is accepted as an alias so a locked clinic can reach the helpdesk
+  // without knowing its internal user id
+  const want = String(receiverId || "").trim();
+  const receiver = userOf(want === "support"
+    ? (db.users.find(isSupport) || {}).id
+    : want);
+  if (!receiver) throw notFound("المستخدم غير موجود");
+  if (receiver.id === sender.id) throw badRequest("لا يمكنك مراسلة نفسك");
+  if (isSiteOwner(sender) || isSupport(sender)) return receiver;
+  if (!isSupport(receiver))
+    throw forbidden("التواصل متاح مع الدعم الفني فقط");
+  return receiver;
+}
+
+route("GET", "/api/chat", async (req, res, p, url) => {
+  const s = requireSession(req);
+
+  if (url.searchParams.get("mode") === "conversations") {
+    const partners = chatPartners(s.user);
+    const allUsers = partners
+      .filter((u) => u.id !== s.user.id)
+      .map((u) => ({ id: u.id, fullName: u.fullName, role: u.role, clinicId: u.clinicId }));
+    const conversations = allUsers
+      .map((u) => {
+        const msgs = db.messages.filter(
+          (m) => (m.senderId === s.user.id && m.receiverId === u.id) ||
+                 (m.senderId === u.id && m.receiverId === s.user.id)
+        );
+        const last = msgs[msgs.length - 1];
+        return {
+          // The UI reads conversation.partner / conversation.partnerId and treats
+          // lastMessage as an object ({senderId, message, createdAt}).
+          partnerId: u.id,
+          partner: u,
+          lastMessage: last ? { ...last } : null,
+          lastMessageAt: last ? last.createdAt : null,
+          unreadCount: msgs.filter((m) => m.senderId === u.id && !m.isRead).length,
+        };
+      })
+      .sort((a, b) => String(b.lastMessageAt || "").localeCompare(String(a.lastMessageAt || "")));
+    return json(res, 200, { conversations, allUsers });
+  }
+
+  const withId = url.searchParams.get("with");
+  if (withId) {
+    // reading a thread is the same door as writing to it: a clinic may only
+    // open the thread it is allowed to have, i.e. with support
+    assertCanMessage(s.user, withId);
+    let dirty = false;
+    for (const m of db.messages) {
+      if (m.senderId === withId && m.receiverId === s.user.id && !m.isRead) { m.isRead = true; dirty = true; }
+    }
+    if (dirty) save();
+
+    const messages = db.messages
+      .filter((m) => (m.senderId === s.user.id && m.receiverId === withId) ||
+                     (m.senderId === withId && m.receiverId === s.user.id))
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+      .map((m) => {
+        const sender = userOf(m.senderId);
+        return { ...m, sender: sender ? { id: sender.id, fullName: sender.fullName, role: sender.role } : null };
+      });
+    return json(res, 200, { messages });
+  }
+
+  json(res, 200, { messages: [] });
+});
+
+route("POST", "/api/chat", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (!b.receiverId || !String(b.message || "").trim())
+    throw badRequest("الرسالة أو المستلم مطلوب");
+  assertCanMessage(s.user, b.receiverId);
+  const msg = {
+    id: uid("msg"), senderId: s.user.id, receiverId: b.receiverId,
+    message: String(b.message).trim(), isRead: false, createdAt: now(),
+  };
+  db.messages.push(msg);
+  save();
+  json(res, 200, msg);
+});
+
+/* ── PLANS (public: landing page pricing) ── */
+
+/**
+ * `plan.features` historically lives in the db as an array while the client
+ * JSON.parses it, and a single array value used to throw inside a React render
+ * and blank the whole page. Always hand the client one predictable shape.
+ */
+function planForClient(plan) {
+  const raw = plan.features;
+  let list = [];
+  if (Array.isArray(raw)) list = raw;
+  else if (typeof raw === "string" && raw.trim()) {
+    try { const parsed = JSON.parse(raw); if (Array.isArray(parsed)) list = parsed; }
+    catch { list = raw.split("\n").map((x) => x.trim()).filter(Boolean); }
+  }
+  return { ...plan, features: JSON.stringify(list.map((x) => String(x))) };
+}
+
+route("GET", "/api/subscriptions", async (req, res, p, url) => {
+  const s = currentSession(req);
+  const isAdmin = s && s.user.role === "super_admin" && url.searchParams.get("all") === "true";
+  json(res, 200, db.plans.filter((x) => isAdmin || x.isActive).sort((a, b) => a.sortOrder - b.sortOrder).map(planForClient));
+});
+
+route("POST", "/api/subscriptions", async (req, res) => {
+  requireSuperAdmin(req);
+  const b = await readBody(req);
+  if (!b.name) throw badRequest("اسم الخطة مطلوب");
+  const plan = {
+    id: uid("plan"), name: b.name, description: b.description || "",
+    price: num(b.price), yearlyPrice: num(b.yearlyPrice), maxPatients: num(b.maxPatients),
+    maxDoctors: num(b.maxDoctors), maxClinics: num(b.maxClinics),
+    isPopular: !!b.isPopular, isActive: b.isActive !== false,
+    sortOrder: num(b.sortOrder, db.plans.length),
+    features: planFeatureList(b.features),
+    createdAt: now(),
+  };
+  db.plans.push(plan);
+  save();
+  json(res, 200, planForClient(plan));
+});
+
+route("PUT", "/api/subscriptions/:id", async (req, res, p) => {
+  requireSuperAdmin(req);
+  const b = await readBody(req);
+  const plan = db.plans.find((x) => x.id === p.id);
+  if (!plan) throw notFound("الخطة غير موجودة");
+  for (const k of ["name", "description", "price", "yearlyPrice", "maxPatients",
+    "maxDoctors", "maxClinics", "isPopular", "isActive", "sortOrder"])
+    if (b[k] !== undefined) plan[k] = b[k];
+  if (b.features !== undefined) plan.features = planFeatureList(b.features);
+  save();
+  json(res, 200, planForClient(plan));
+});
+
+route("DELETE", "/api/subscriptions/:id", async (req, res, p) => {
+  requireSuperAdmin(req);
+  const i = db.plans.findIndex((x) => x.id === p.id);
+  if (i < 0) throw notFound("الخطة غير موجودة");
+  db.plans.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/** Accepts an array, a JSON string or newline separated text; stores an array. */
+function planFeatureList(input) {
+  if (Array.isArray(input)) return input.map((x) => String(x)).filter(Boolean);
+  const text = String(input || "").trim();
+  if (!text) return [];
+  try { const parsed = JSON.parse(text); if (Array.isArray(parsed)) return parsed.map((x) => String(x)).filter(Boolean); }
+  catch { /* fall through to the plain-text shape */ }
+  return text.split("\n").map((x) => x.trim()).filter(Boolean);
+}
+
+/* ── CLINIC SUBSCRIPTIONS ── */
+
+route("GET", "/api/clinic-subscriptions", async (req, res, p, url) => {
+  const s = requireSession(req);
+  // the site owner has no clinicId of their own, so ?all=true is the only way
+  // they can ever see the list they are supposed to manage
+  const all = isSiteOwner(s.user) && url.searchParams.get("all") === "true";
+  const list = all
+    ? db.clinicSubscriptions
+    : db.clinicSubscriptions.filter((c) => c.clinicId === s.user.clinicId);
+  json(res, 200, list.map((c) => ({
+    ...c,
+    plan: db.plans.find((x) => x.id === c.planId) || null,
+    clinicName: (clinicOf(c.clinicId) || {}).name || "",
+  })));
+});
+
+route("POST", "/api/clinic-subscriptions", async (req, res) => {
+  // only the site owner may switch a clinic to a paid plan: otherwise a trial
+  // owner could grant themselves an active subscription and hire anyway
+  const s = requireSuperAdmin(req);
+  const b = await readBody(req);
+  const clinicId = String(b.clinicId || "");
+  if (!clinicId || !db.clinics.some((c) => c.id === clinicId))
+    throw badRequest("العيادة غير موجودة");
+  const planId = String(b.planId || "");
+  // planId is optional: the owner often just wants to switch a clinic to a paid
+  // term without picking a tier, so a missing/blank one means the default plan.
+  // A planId that IS given but unknown is still a client bug worth reporting.
+  const plan = db.plans.find((p) => p.id === planId) ||
+    (planId ? null : db.plans[0]);
+  if (!plan) throw badRequest("الخطة غير موجودة");
+  const planRef = planId || plan.id;
+
+  const status = ["active", "trial", "cancelled", "expired"].includes(b.status) ? b.status : "active";
+  const start = b.startDate || now();
+  // default to the plan's own term so a grant always has a real end date
+  const end = b.endDate ||
+    new Date(Date.now() + (b.billingCycle === "yearly" ? 365 : 30) * 864e5).toISOString();
+
+  // one live row per clinic: stacking them left the old trial shadowing the
+  // grant, and accessSubscription() kept picking whichever sorted first
+  const live = db.clinicSubscriptions.filter(
+    (c) => c.clinicId === clinicId && ["active", "trial"].includes(c.status)
+  );
+  let sub;
+  if (live.length) {
+    sub = live[0];
+    Object.assign(sub, { planId: planRef, status, startDate: start, endDate: end,
+      trialEndDate: status === "trial" ? end : null,
+      billingCycle: b.billingCycle || "monthly", notes: b.notes || "" });
+    // older data may already hold several live rows for one clinic: keep the
+    // first as the grant and retire the rest so nothing shadows it later
+    for (const extra of live.slice(1)) {
+      extra.status = "expired";
+      extra.endDate = start;
+      extra.notes = "استُبدل باشتراك جديد";
+    }
+  } else {
+    sub = {
+      id: uid("cs"), clinicId, planId: planRef, status, startDate: start, endDate: end,
+      trialEndDate: status === "trial" ? end : null,
+      billingCycle: b.billingCycle || "monthly", notes: b.notes || "",
+    };
+    db.clinicSubscriptions.push(sub);
+  }
+  save();
+  json(res, 200, { ...sub, plan, clinicName: (clinicOf(clinicId) || {}).name || "" });
+});
+
+route("PUT", "/api/clinic-subscriptions/:id", async (req, res, p) => {
+  requireSuperAdmin(req);
+  const b = await readBody(req);
+  const sub = db.clinicSubscriptions.find((c) => c.id === p.id);
+  if (!sub) throw notFound("الاشتراك غير موجود");
+  for (const k of ["planId", "status", "startDate", "endDate", "trialEndDate", "billingCycle", "notes"])
+    if (b[k] !== undefined) sub[k] = b[k];
+  // per-clinic module off-switches — the owner's "like permissions" picker
+  if (b.modules !== undefined) sub.modules = sanitizeModules(b.modules);
+  save();
+  json(res, 200, sub);
+});
+
+route("DELETE", "/api/clinic-subscriptions/:id", async (req, res, p) => {
+  requireSuperAdmin(req);
+  const i = db.clinicSubscriptions.findIndex((c) => c.id === p.id);
+  if (i < 0) throw notFound("الاشتراك غير موجود");
+  db.clinicSubscriptions.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── OFFERS (public: landing page offers) ── */
+
+route("GET", "/api/offers", async (req, res) => {
+  const s = currentSession(req);
+  const isAdmin = s && s.user.role === "super_admin";
+  json(res, 200, db.offers.filter((o) => isAdmin || o.isActive));
+});
+
+route("POST", "/api/offers", async (req, res) => {
+  requireSuperAdmin(req);
+  const b = await readBody(req);
+  if (!b.title) throw badRequest("عنوان العرض مطلوب");
+  const offer = {
+    id: uid("offer"), title: b.title, description: b.description || "", badge: b.badge || "",
+    discountType: b.discountType || "percentage", discountValue: num(b.discountValue),
+    startDate: b.startDate || "", endDate: b.endDate || "",
+    isActive: b.isActive !== false, createdAt: now(),
+  };
+  db.offers.push(offer);
+  save();
+  json(res, 200, offer);
+});
+
+route("PUT", "/api/offers/:id", async (req, res, p) => {
+  requireSuperAdmin(req);
+  const b = await readBody(req);
+  const offer = db.offers.find((o) => o.id === p.id);
+  if (!offer) throw notFound("العرض غير موجود");
+  for (const k of ["title", "description", "badge", "discountType", "discountValue", "startDate", "endDate", "isActive"])
+    if (b[k] !== undefined) offer[k] = b[k];
+  save();
+  json(res, 200, offer);
+});
+
+route("DELETE", "/api/offers/:id", async (req, res, p) => {
+  requireSuperAdmin(req);
+  const i = db.offers.findIndex((o) => o.id === p.id);
+  if (i < 0) throw notFound("العرض غير موجود");
+  db.offers.splice(i, 1);
+  save();
+  json(res, 200, { success: true });
+});
+
+/* ── PUBLIC PATIENT BOOKING (no login) ── */
+
+/* The public day grid runs exactly like the app's own one: 08:00 through 22:00. */
+const BOOKING_WINDOW = { openHour: 8, closeHour: 22, daysAhead: 90 };
+
+/** Tiny in-memory throttle so the public form can't be used to flood the db. */
+const bookingHits = new Map();
+function throttleBooking(req) {
+  const ip = req.socket.remoteAddress || "unknown";
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  const list = (bookingHits.get(ip) || []).filter((t) => t > cutoff);
+  if (list.length >= 8) throw new AppError(429, "محاولات كثيرة جداً، حاول بعد قليل");
+  list.push(Date.now());
+  bookingHits.set(ip, list);
+  if (bookingHits.size > 5000) bookingHits.clear(); // keep the map bounded
+}
+
+const clinicBySlug = (slug) =>
+  db.clinics.find((c) => String(c.bookingSlug || "").toLowerCase() === String(slug || "").toLowerCase()) || null;
+
+function requireBookable(slug) {
+  const clinic = clinicBySlug(slug);
+  if (!clinic) throw notFound("رابط الحجز غير صحيح");
+  if (!clinic.bookingEnabled) throw new AppError(403, "الحجز عبر الموقع غير مفعّل لهذه العيادة");
+  return clinic;
+}
+
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/** The clinic's active bookable menu, ordered for display. */
+function clinicServices(clinic, activeOnly = true) {
+  return db.services
+    .filter((x) => x.clinicId === clinic.id && (!activeOnly || x.isActive !== false))
+    .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
+}
+
+/** Public-safe shape of a service: no internal ids beyond its own. */
+function serviceForClient(clinic, s) {
+  return {
+    id: s.id, name: s.name, description: s.description || "",
+    durationMin: serviceDuration(s), price: num(s.price, 0),
+  };
+}
+
+/**
+ * Slot start times for a date, minus anything already booked — by the app or by
+ * this page. Slots chain: the first starts at the opening hour (08:00) and each
+ * following start lands exactly `durationMin` after the previous one, so a 15
+ * minute clinic offers 08:00, 08:15, 08:30 … A busy stretch (a longer treatment
+ * booked from the app) is skipped and the chain resumes the moment it ends, so
+ * the next patient always starts when the previous visit is actually over.
+ */
+function bookingSlots(clinic, dateStr, doctorId, durationMin) {
+  const day = new Date(`${dateStr}T00:00:00`);
+  if (Number.isNaN(day.getTime())) throw badRequest("التاريخ غير صالح");
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const max = new Date(today); max.setDate(max.getDate() + BOOKING_WINDOW.daysAhead);
+  if (day < today) throw badRequest("لا يمكن الحجز في تاريخ سابق");
+  if (day > max) throw badRequest(`الحجز متاح حتى ${BOOKING_WINDOW.daysAhead} يوماً مقدماً`);
+
+  const dur = Math.max(1, num(durationMin, DEFAULT_APPTMENT_MIN) || DEFAULT_APPTMENT_MIN);
+  const step = Math.max(DEFAULT_APPTMENT_MIN, dur);
+
+  // busy = [startMs, endMs) of everything already booked that day, whichever
+  // door it came through (the app, or this page) — a booked hour is a booked hour
+  const busy = db.appointments
+    .filter((a) => a.clinicId === clinic.id && !["cancelled", "canceled"].includes(String(a.status)))
+    .filter((a) => (doctorId ? a.doctorId === doctorId : true))
+    .filter((a) => sameDay(a.startTime, day))
+    .map((a) => {
+      const startMs = new Date(a.startTime).getTime();
+      const endMs = a.endTime ? new Date(a.endTime).getTime() : startMs + dur * 60000;
+      return [startMs, Number.isFinite(endMs) && endMs > startMs ? endMs : startMs + dur * 60000];
+    });
+
+  const out = [];
+  const nowMs = Date.now();
+  const openMin = BOOKING_WINDOW.openHour * 60;
+  const closeMin = BOOKING_WINDOW.closeHour * 60;   // 22:00 is a valid start, like in the app
+  for (let t = openMin; t <= closeMin; t += step) {
+    const hh = Math.floor(t / 60), mm = t % 60;
+    const start = new Date(day); start.setHours(hh, mm, 0, 0);
+    const startMs = start.getTime();
+    const endMs = startMs + dur * 60000;
+    const clash = busy.some(([bs, be]) => startMs < be && bs < endMs);
+    out.push({
+      time: `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`,
+      available: !clash && startMs > nowMs,
+    });
+  }
+  return out;
+}
+
+/**
+ * The earliest bookable slot on or after `fromDateStr` (today when missing),
+ * scanning the whole booking window. Returns { date, time } or null when the
+ * clinic is fully booked for the next `daysAhead` days. This is what lets the
+ * public page hand the patient a time instead of asking them to pick one.
+ */
+function nextAvailable(clinic, fromDateStr, doctorId, durationMin) {
+  const start = new Date(`${fromDateStr}T00:00:00`);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const base = Number.isNaN(start.getTime()) || start < today ? today : start;
+  const max = new Date(today); max.setDate(max.getDate() + BOOKING_WINDOW.daysAhead);
+  for (let i = 0; i <= BOOKING_WINDOW.daysAhead; i++) {
+    const d = new Date(base); d.setDate(d.getDate() + i);
+    if (d > max) break;
+    const ds = ymd(d);
+    const free = bookingSlots(clinic, ds, doctorId, durationMin).find((s) => s.available);
+    if (free) return { date: ds, time: free.time };
+  }
+  return null;
+}
+
+/** Look up one bookable service of this clinic, or null. */
+function pickService(clinic, serviceId) {
+  if (!serviceId) return null;
+  return clinicServices(clinic).find((x) => x.id === String(serviceId)) || null;
+}
+
+route("GET", "/api/public/booking/:slug", async (req, res, p) => {
+  const clinic = requireBookable(p.slug);
+  res.setHeader("Cache-Control", "no-store");
+  json(res, 200, {
+    clinic: {
+      name: clinic.name, address: clinic.address || "", phone: clinic.phone || "",
+      currency: clinic.currency || "SAR",
+    },
+    services: clinicServices(clinic).map((s) => serviceForClient(clinic, s)),
+    doctors: db.users
+      .filter((u) => u.clinicId === clinic.id && ["doctor", "nurse"].includes(u.role))
+      .map((u) => ({ id: u.id, fullName: u.fullName })),
+    window: BOOKING_WINDOW,
+  });
+});
+
+route("GET", "/api/public/booking/:slug/slots", async (req, res, p, url) => {
+  const clinic = requireBookable(p.slug);
+  res.setHeader("Cache-Control", "no-store");
+  const date = url.searchParams.get("date") || ymd(new Date());
+  const doctorId = url.searchParams.get("doctorId") || "";
+  const service = pickService(clinic, url.searchParams.get("serviceId"));
+  const durationMin = service ? serviceDuration(service) : DEFAULT_APPTMENT_MIN;
+  json(res, 200, {
+    date,
+    durationMin,
+    next: nextAvailable(clinic, date, doctorId, durationMin),
+    slots: bookingSlots(clinic, date, doctorId, durationMin),
+  });
+});
+
+route("POST", "/api/public/booking/:slug", async (req, res, p) => {
+  throttleBooking(req);
+  const clinic = requireBookable(p.slug);
+  const b = await readBody(req);
+
+  const name = String(b.patientName || b.name || "").trim();
+  const phone = String(b.phone || "").trim();
+  const date = String(b.date || "").trim();
+  const wanted = String(b.time || "").trim();
+  const doctorId = String(b.doctorId || "");
+
+  if (name.length < 3) throw badRequest("الاسم مطلوب (٣ أحرف على الأقل)");
+  if (!/^[\d+\-\s()]{7,20}$/.test(phone)) throw badRequest("رقم جوال غير صالح");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw badRequest("التاريخ غير صالح");
+
+  if (doctorId && !db.users.some((u) => u.id === doctorId && u.clinicId === clinic.id))
+    throw badRequest("الطبيب المحدد غير موجود");
+
+  const service = pickService(clinic, b.serviceId);
+  if (b.serviceId && !service) throw badRequest("الخدمة المحددة غير متاحة");
+  const durationMin = service ? serviceDuration(service) : DEFAULT_APPTMENT_MIN;
+
+  // One visit per person per day: match on the phone digits so different
+  // spellings of the same number can't sneak a second booking through.
+  const phoneDigits = (v) => String(v).replace(/\D/g, "");
+  const samePhoneDay = db.appointments.some((a) => {
+    if (a.clinicId !== clinic.id) return false;
+    if (a.status === "cancelled" || a.status === "canceled") return false;
+    if (!a.startTime || ymd(new Date(a.startTime)) !== date) return false;
+    const owner = db.patients.find((p2) => p2.id === a.patientId);
+    return !!owner && phoneDigits(owner.phone) === phoneDigits(phone);
+  });
+  if (samePhoneDay)
+    throw new AppError(409, "لديك موعد محجوز بالفعل في هذا اليوم — لا يمكن حجز أكثر من موعد واحد في نفس اليوم");
+
+  // The patient never picks a time: the clinic hands out the earliest free slot
+  // on the chosen day, chained right after whatever is already booked. An
+  // explicit, still-free `time` from an older client is still honoured.
+  const daySlots = bookingSlots(clinic, date, doctorId, durationMin);
+  const chosen =
+    (wanted && daySlots.find((s) => s.time === wanted && s.available)) ||
+    daySlots.find((s) => s.available);
+  if (!chosen)
+    throw new AppError(409, "عذراً، انتهت المواعيد المتاحة في هذا اليوم — جرّب يوماً آخر");
+  const time = chosen.time;
+
+  const startMs = new Date(`${date}T${time}:00`).getTime();
+  if (appointmentClashes(clinic.id, doctorId, startMs, startMs + durationMin * 60000))
+    throw new AppError(409, "عذراً، انتهت المواعيد المتاحة في هذا اليوم — جرّب يوماً آخر");
+
+  // reuse an existing patient with the same phone, otherwise create one
+  let patient = db.patients.find((p2) => p2.clinicId === clinic.id && p2.phone === phone);
+  if (!patient) {
+    patient = {
+      id: uid("pat"), clinicId: clinic.id, fullName: name, gender: b.gender || "",
+      age: num(b.age, 0), phone, email: String(b.email || ""),
+      bloodType: "", allergies: "", source: "booking", createdAt: now(),
+    };
+    db.patients.push(patient);
+  }
+
+  const start = new Date(`${date}T${time}:00`);
+  const appt = {
+    id: uid("apt"), clinicId: clinic.id, patientId: patient.id, doctorId,
+    title: service ? service.name : "حجز عبر الموقع", type: "consultation",
+    serviceId: service ? service.id : "",
+    price: service ? num(service.price, 0) : 0,
+    startTime: start.toISOString(),
+    endTime: new Date(start.getTime() + durationMin * 60000).toISOString(),
+    status: "scheduled", notes: String(b.note || "").slice(0, 500),
+    source: "booking", createdAt: now(),
+  };
+  db.appointments.push(appt);
+  save();
+
+  json(res, 200, {
+    success: true,
+    appointment: {
+      id: appt.id, date, time, clinicName: clinic.name,
+      serviceName: service ? service.name : "",
+      durationMin, price: appt.price, currency: clinic.currency || "SAR",
+    },
+    message: `تم استلام طلب الحجز بنجاح، ${name}.`,
+  });
+});
+
+/* ── PUBLIC BOOKING PAGE (self-contained, no build step) ── */
+
+const { buildBookingPage } = require("./booking-page.js");
+
+/**
+ * Resolve the clinic behind the slug and hand the resolved values to the
+ * standalone builder in booking-page.js, which owns the page's HTML/CSS/JS.
+ */
+function bookingPage(slug) {
+  const clinic = clinicBySlug(slug);
+  const name = clinic ? clinic.name : "عيادة";
+  const ok = !!clinic && !!clinic.bookingEnabled;
+  return buildBookingPage({
+    slug: ok ? slug : null,
+    name,
+    daysAhead: BOOKING_WINDOW.daysAhead,
+  });
+}
+
+/* ── BACKUP ── */
+
+route("POST", "/api/backup/export", async (req, res) => {
+  const s = requireSuperAdmin(req);
+  const payload = {
+    exportedAt: now(),
+    exportedBy: s.user.fullName,
+    clinics: db.clinics,
+    users: db.users.map(publicUser),
+    patients: db.patients,
+    appointments: db.appointments,
+    invoices: db.invoices,
+    tasks: db.tasks,
+    records: db.records,
+    inventory: db.inventory,
+    plans: db.plans,
+    clinicSubscriptions: db.clinicSubscriptions,
+    offers: db.offers,
+  };
+  respond(res, 200, JSON.stringify(payload, null, 2), {
+    "Content-Type": MIME[".json"],
+    "Content-Disposition": `attachment; filename="clinic-backup-${Date.now()}.json"`,
+  });
+});
+
+/* ══════════════════════════ 9. STATIC FILES ══════════════════════════ */
+
+/** Returns an absolute path inside ROOT, or null if it escapes / is unusable. */
+function resolveStatic(rawPath) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(rawPath);
+  } catch {
+    return null; // malformed percent-encoding
+  }
+  if (decoded.includes("\0")) return null;
+
+  if (decoded.endsWith("/")) decoded += "index.html";
+  const target = path.resolve(ROOT, `.${path.posix.normalize(decoded)}`);
+  const root = path.resolve(ROOT);
+
+  if (target !== root && !target.startsWith(root + path.sep)) return null; // traversal
+  return target;
+}
+
+async function statOrNull(p) {
+  try {
+    return await fsp.stat(p);
+  } catch {
+    return null;
+  }
+}
+
+/** Streams a file. Every failure mode resolves instead of throwing. */
+function pipeFile(req, res, file, st, cacheControl) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+
+    const stream = fs.createReadStream(file);
+
+    stream.on("error", (e) => {
+      fail("static read failed:", path.relative(ROOT, file), e.code || e.message);
+      if (!res.headersSent) respond(res, 500, { error: "تعذّر قراءة الملف" });
+      else try { res.end(); } catch { /* gone */ }
+      done();
+    });
+
+    res.on("close", () => { stream.destroy(); done(); }); // client aborted
+    res.on("error", () => { stream.destroy(); done(); });
+    res.on("finish", done);
+
+    try {
+      res.writeHead(200, {
+        "Content-Type": MIME[path.extname(file).toLowerCase()] || "application/octet-stream",
+        "Content-Length": st.size,
+        "Cache-Control": cacheControl,
+        "Last-Modified": st.mtime.toUTCString(),
+      });
+      stream.pipe(res);
+    } catch (e) {
+      fail("static write failed:", e.message);
+      stream.destroy();
+      try { res.end(); } catch { /* gone */ }
+      done();
+    }
+  });
+}
+
+async function serveStatic(req, res, urlPath) {
+  const target = resolveStatic(urlPath);
+
+  if (target) {
+    let st = await statOrNull(target);
+    if (st && st.isDirectory()) {
+      const idx = path.join(target, "index.html");
+      st = await statOrNull(idx);
+      if (st && st.isFile())
+        return pipeFile(req, res, idx, st, "no-store");
+    } else if (st && st.isFile()) {
+      const ext = path.extname(target).toLowerCase();
+      return pipeFile(req, res, target, st, ext === ".html" ? "no-store" : "public, max-age=3600");
+    }
+  }
+
+  // SPA fallback — the app is client-side routed, so unknown paths get the shell.
+  if (!path.extname(urlPath)) {
+    const shell = path.join(ROOT, "index.html");
+    const st = await statOrNull(shell);
+    if (st && st.isFile()) return pipeFile(req, res, shell, st, "no-store");
+  }
+
+  return false;
+}
+
+/* ══════════════════════════ 10. REQUEST PIPELINE ══════════════════════════ */
+
+const ALLOWED_ORIGIN = process.env.ORIGIN || null;
+
+function cors(req, res) {
+  const origin = req.headers.origin;
+  if (origin && (!ALLOWED_ORIGIN || origin === ALLOWED_ORIGIN)) {
+    res.setHeader("Access-Control-Allow-Origin", origin); // reflect, never "*" with credentials
+    res.setHeader("Vary", "Origin");
+  } else if (!origin) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,PATCH,OPTIONS");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+}
+
+async function handle(req, res) {
+  cors(req, res);
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  let urlPath;
+  try {
+    const raw = req.url || "/";
+    if (raw.length > LIMITS.urlBytes) throw badRequest("الرابط طويل جداً");
+    urlPath = new URL(raw, "http://localhost").pathname;
+  } catch (e) {
+    respond(res, 400, { error: e.expected ? e.message : "طلب غير صالح" });
+    return;
+  }
+
+  if (urlPath.startsWith("/api/")) {
+    const match = routes.find((r) => r.method === req.method && r.rx.test(urlPath));
+    if (!match) {
+      const pathExists = routes.some((r) => r.rx.test(urlPath));
+      respond(res, pathExists ? 405 : 404,
+        { error: pathExists ? "طريقة الطلب غير مدعومة" : "المسار غير موجود" });
+      return;
+    }
+
+    const m = urlPath.match(match.rx);
+    const params = {};
+    match.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+
+    try {
+      enforceSubscription(req, urlPath);
+      enforcePermission(req, urlPath);
+      await match.handler(req, res, params, new URL(req.url, "http://localhost"));
+    } catch (e) {
+      const status = e instanceof AppError ? e.status : 500;
+      if (status >= 500) fail(`${req.method} ${urlPath} →`, e.stack || e.message);
+      else warn(`${req.method} ${urlPath} → ${status} ${e.message}`);
+      respond(res, status, { error: status >= 500 ? "حدث خطأ في الخادم" : e.message });
+    }
+    return;
+  }
+
+  if (req.method === "GET" || req.method === "HEAD") {
+    // public booking page: /booking/<slug>
+    const bmatch = urlPath.match(/^\/booking\/([^/]+)\/?$/);
+    if (bmatch) {
+      let slug = "";
+      try { slug = decodeURIComponent(bmatch[1]); } catch { slug = bmatch[1]; }
+      respond(res, 200, bookingPage(slug), {
+        "Content-Type": `${MIME[".html"]}; charset=utf-8`,
+        "Cache-Control": "no-store",
+        "X-Robots-Tag": "noindex",
+      });
+      return;
+    }
+    if (await serveStatic(req, res, urlPath)) return;
+  }
+
+  respond(res, 404, { error: "الصفحة غير موجودة" }, { "Content-Type": MIME[".html"] });
+}
+
+const server = http.createServer((req, res) => {
+  // A reset/broken socket is normal on the web — never let it reach the process.
+  res.on("error", () => {});
+  req.on("error", () => {});
+  req.on("aborted", () => {});
+
+  // The single safety net: nothing an async handler does can kill the process.
+  Promise.resolve()
+    .then(() => handle(req, res))
+    .catch((e) => {
+      fail("unhandled in request pipeline:", (e && e.stack) || e);
+      respond(res, 500, { error: "حدث خطأ في الخادم" });
+    });
+});
+
+server.maxConnections = LIMITS.maxConnections;
+server.headersTimeout = LIMITS.headersTimeout;
+server.requestTimeout = LIMITS.requestTimeout;
+server.keepAliveTimeout = LIMITS.keepAliveTimeout;
+server.on("clientError", (e, socket) => {
+  warn("clientError:", e.code || e.message);
+  if (socket && !socket.destroyed && socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+  else if (socket && !socket.destroyed) socket.destroy();
+});
+
+/* ══════════════════════════ 11. BOOT & LIFECYCLE ══════════════════════════ */
+
+function processAliveHooks() {
+  process.on("uncaughtException", (e) => {
+    fail("UNCAUGHT EXCEPTION — server kept alive:", (e && e.stack) || e);
+    toFile(`FATAL uncaughtException: ${(e && e.stack) || e}`);
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    fail("UNHANDLED REJECTION — server kept alive:", (reason && reason.stack) || reason);
+    toFile(`FATAL unhandledRejection: ${(reason && reason.stack) || reason}`);
+  });
+
+  process.on("warning", (w) => warn("process warning:", w.name, w.message));
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+let closing = false;
+function shutdown(signal) {
+  if (closing) return;
+  closing = true;
+  log(`${signal} received — shutting down gracefully...`);
+  clearInterval(sweeper);
+  server.close(() => {
+    flush().finally(() => {
+      log("goodbye.");
+      process.exit(0);
+    });
+  });
+  // don't hang forever on stuck keep-alive sockets
+  setTimeout(() => {
+    warn("forcing exit after 5s");
+    process.exit(0);
+  }, 5000).unref();
+}
+
+function listen(port, host, attemptsLeft = 12) {
+  server.once("error", (e) => {
+    if (e.code === "EADDRINUSE") {
+      const hint =
+        `\n  ✖ المنفذ ${port} مستخدم بالفعل — هناك نسخة أخرى تعمل.\n` +
+        `\n` +
+        `   Solutions:\n` +
+        `      • افتح الموقع في المتصفح:  http://${host}:${port}\n` +
+        `      • أوقف النسخة الأخرى:      taskkill /PID <PID> /F\n` +
+        `      • أو شغّل على منفذ آخر:     node server.js --port ${port + 1}\n` +
+        `      • أو منفذ تلقائي:           node server.js --auto-port\n`;
+
+      if (AUTO_PORT && attemptsLeft > 0) {
+        warn(`port ${port} busy — trying ${port + 1}`);
+        listen(port + 1, host, attemptsLeft - 1);
+        return;
+      }
+      fail(hint);
+      toFile(`FATAL EADDRINUSE on ${host}:${port} — another instance is already running`);
+      process.exit(1); // explicit, with a readable message instead of a raw stack dump
+    }
+
+    if (e.code === "EACCES") {
+      fail(
+        `\n  ✖ لا توجد صلاحية لاستخدام المنفذ ${port}.\n` +
+          `    Use a port above 1023, e.g.  node server.js --port ${port + 1}\n`
+      );
+      toFile(`FATAL EACCES on ${host}:${port}`);
+      process.exit(1);
+    }
+
+    fail("listen failed:", (e && e.stack) || e);
+    toFile(`FATAL listen: ${(e && e.stack) || e}`);
+    process.exit(1);
+  });
+
+  server.listen(port, host);
+}
+
+const sweeper = setInterval(() => {
+  try {
+    const removed = pruneSessions(db);
+    if (removed) {
+      save();
+      log(`swept ${removed} expired session(s)`);
+    }
+  } catch (e) {
+    fail("session sweeper error:", e.message); // never let the interval die
+  }
+}, LIMITS.sessionSweepMs);
+if (sweeper.unref) sweeper.unref();
+
+function banner(actualPort) {
+  const mem = Math.round(process.memoryUsage().rss / 1048576);
+  console.log(`
+  ┌──────────────────────────────────────────────┐
+  │   نظام عيادة — يعمل محلياً                    │
+  └──────────────────────────────────────────────┘
+
+     ▸ الموقع     http://${HOST}:${actualPort}
+     ▸ الصحة      http://${HOST}:${actualPort}/api/health
+     ▸ Node       ${process.version}   (RSS ${mem} MB)
+
+     حسابات تجريبية:
+       admin      / admin123       مدير عام
+       doctor     / doctor123      طبيب
+       reception  / reception123   استقبال
+
+     البيانات    data/db.json
+     السجل       data/server.log
+     إيقاف       Ctrl+C
+`);
+}
+
+processAliveHooks();
+load();
+listen(PORT, HOST);
+server.on("listening", () => banner(server.address().port));

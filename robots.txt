@@ -1,0 +1,26 @@
+# Security: Block all crawlers — this is a private clinic management system
+User-agent: *
+Disallow: /
+
+# Explicitly block known security-affecting crawlers
+User-agent: AhrefsBot
+Disallow: /
+
+User-agent: SemrushBot
+Disallow: /
+
+User-agent: MJ12bot
+Disallow: /
+
+User-agent: DotBot
+Disallow: /
+
+User-agent: Baiduspider
+Disallow: /
+
+User-agent: YandexBot
+Disallow: /
+
+# Allow only favicon
+Allow: /favicon.ico
+Allow: /favicon.svg

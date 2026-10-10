@@ -1,0 +1,19 @@
+{
+  "name": "عيادة - نظام إدارة العيادات",
+  "short_name": "عيادة",
+  "description": "نظام متكامل لإدارة العيادات والمواعيد والمرضى والفواتير",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0a1620",
+  "theme_color": "#0d9488",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
