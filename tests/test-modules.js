@@ -1,3 +1,4 @@
+const path = require("path");
 ﻿/* The owner's new "وحدات العيادات" picker in the subscriptions screen.
  *   - a section switched off for a clinic disappears from that clinic's menu
  *   - the same map makes the API refuse the calls (effectivePermissions)
@@ -8,7 +9,7 @@
 const http = require("http");
 const fs = require("fs");
 
-const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
+const DB = path.join(__dirname, "..", "data", "db.json");
 let pass = 0, fail = 0;
 const check = (n, ok, extra = "") => {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${n}${extra ? "   " + extra : ""}`);

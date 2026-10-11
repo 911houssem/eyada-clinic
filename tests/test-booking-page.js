@@ -1,8 +1,9 @@
+const path = require("path");
 // Checks the public booking page: the shell the tests have always asserted,
 // plus the new service picker, the summary panel and the duration-aware wiring.
 const http = require("http");
 const fs = require("fs");
-const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
+const DB = path.join(__dirname, "..", "data", "db.json");
 
 let pass = 0, fail = 0;
 const check = (name, cond, extra = "") => {

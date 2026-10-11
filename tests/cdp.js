@@ -6,7 +6,21 @@ const os = require("os");
 const fs = require("fs");
 const path = require("path");
 
-const CHROME = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const CHROME = (() => {
+  const candidates = [
+    process.env.CHROME_PATH,
+    process.env.CHROME,
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try { if (fs.existsSync(c)) return c; } catch { /* keep looking */ }
+  }
+  return process.env.CHROME_PATH || "chrome"; // fall back to whatever is on PATH
+})();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

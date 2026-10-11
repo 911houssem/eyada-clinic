@@ -1,3 +1,4 @@
+const path = require("path");
 ﻿/* Drives the real app UI in headless Chrome:
  *  - clinic owner: new "الخدمات والأسعار" screen edits price + duration
  *  - clinic owner: new "الأمان" screen has the change-password form
@@ -9,7 +10,7 @@ const http = require("http");
 const fs = require("fs");
 const { launch, newPage, sleep } = require("./cdp.js");
 
-const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
+const DB = path.join(__dirname, "..", "data", "db.json");
 let pass = 0, fail = 0;
 const check = (n, ok, extra = "") => {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${n}${extra ? "   " + extra : ""}`);

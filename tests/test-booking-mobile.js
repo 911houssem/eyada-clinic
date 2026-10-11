@@ -1,7 +1,7 @@
 /** Mobile-width sanity pass: the same page at 420px must still render everything. */
 const { spawnSync } = require("child_process");
 
-const CHROME = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const { CHROME } = require("./cdp.js");
 const URL = "http://127.0.0.1:3000/booking/al-noor-clinic";
 
 let pass = 0, fail = 0;

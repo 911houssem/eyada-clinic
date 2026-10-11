@@ -1,3 +1,4 @@
+const path = require("path");
 // HTTP tests for this round's server.js changes:
 //  - plans features serialised consistently (string) and tolerated (array)
 //  - /api/tasks readable per clinic, writes scoped to own clinic
@@ -5,7 +6,7 @@
 //  - /api/clinic-subscriptions readable by clinic owners, writes super_admin only
 const http = require("http");
 const fs = require("fs");
-const ROOT = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main";
+const ROOT = path.join(__dirname, "..");
 const DB = ROOT + "\\data\\db.json";
 
 let pass = 0, fail = 0;

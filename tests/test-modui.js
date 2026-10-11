@@ -1,3 +1,4 @@
+const path = require("path");
 ﻿/* End-to-end check of the owner's "وحدات العيادات" picker:
  *  - the subscriptions screen shows the card with one chip per module
  *  - switching المواعيد off for a clinic drops it from that clinic's sidebar
@@ -8,7 +9,7 @@ const http = require("http");
 const fs = require("fs");
 const { launch, newPage, sleep } = require("./cdp.js");
 
-const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
+const DB = path.join(__dirname, "..", "data", "db.json");
 let pass = 0, fail = 0;
 const check = (n, ok, extra = "") => {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${n}${extra ? "   " + extra : ""}`);

@@ -1,9 +1,10 @@
+const path = require("path");
 // Verifies the new backend behaviour end to end against a live server.
 // Covers: site-owner grant + list, the paywall for an expired clinic,
 // change-password, and service-driven slot durations.
 const http = require("http");
 const fs = require("fs");
-const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
+const DB = path.join(__dirname, "..", "data", "db.json");
 
 let pass = 0, fail = 0;
 function check(name, ok, extra) {

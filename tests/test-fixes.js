@@ -1,7 +1,8 @@
+const path = require("path");
 // Tests for the four reported bugs.
 const http = require("http");
 const fs = require("fs");
-const ROOT = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main";
+const ROOT = path.join(__dirname, "..");
 const DB = ROOT + "\\data\\db.json";
 let pass = 0, fail = 0;
 const check = (name, cond, extra = "") => { console.log(`  ${cond ? "PASS" : "FAIL"}  ${name}${extra ? "   " + extra : ""}`); cond ? pass++ : fail++; };

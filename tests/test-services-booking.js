@@ -1,3 +1,4 @@
+const path = require("path");
 // HTTP tests for the services menu + duration-aware booking overlap:
 //  - /api/services CRUD is clinic-scoped and settings-gated
 //  - durationMin is rounded to the clinic slot grid
@@ -7,7 +8,7 @@
 //    create/move, while back-to-back appointments stay legal
 const http = require("http");
 const fs = require("fs");
-const ROOT = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main";
+const ROOT = path.join(__dirname, "..");
 const DB = ROOT + "\\data\\db.json";
 
 let pass = 0, fail = 0;
