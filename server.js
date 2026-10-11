@@ -133,6 +133,81 @@ function verifyPassword(pw, stored) {
   }
 }
 
+/* ── TOTP (RFC 6238) — powers the optional two-factor login ── */
+const B32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Encode(buf) {
+  let bits = 0, value = 0, out = "";
+  for (const b of buf) {
+    value = (value << 8) | b; bits += 8;
+    while (bits >= 5) { out += B32_ALPHABET[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += B32_ALPHABET[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function base32Decode(str) {
+  const s = String(str).toUpperCase().replace(/[^A-Z2-7]/g, "");
+  let bits = 0, value = 0; const out = [];
+  for (const ch of s) {
+    const idx = B32_ALPHABET.indexOf(ch);
+    if (idx < 0) continue;
+    value = (value << 5) | idx; bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 255); bits -= 8; }
+  }
+  return Buffer.from(out);
+}
+
+/** 6-digit code for a 30-second time step. */
+function totpAt(secret, counter) {
+  const key = base32Decode(secret);
+  const msg = Buffer.alloc(8);
+  msg.writeUInt32BE(Math.floor(counter / 0x100000000), 0);
+  msg.writeUInt32BE(counter >>> 0, 4);
+  const mac = crypto.createHmac("sha1", key).update(msg).digest();
+  const off = mac[mac.length - 1] & 0x0f;
+  const bin = ((mac[off] & 0x7f) << 24) | ((mac[off + 1] & 0xff) << 16)
+    | ((mac[off + 2] & 0xff) << 8) | (mac[off + 3] & 0xff);
+  return String(bin % 1000000).padStart(6, "0");
+}
+
+/** Accepts the current step ±1 to tolerate clock drift. */
+function verifyTotp(secret, code, window = 1) {
+  const c = String(code || "").replace(/\s/g, "");
+  if (!secret || !/^\d{6}$/.test(c)) return false;
+  const counter = Math.floor(Date.now() / 1000 / 30);
+  for (let i = -window; i <= window; i++) if (totpAt(secret, counter + i) === c) return true;
+  return false;
+}
+
+const newTotpSecret = () => base32Encode(crypto.randomBytes(20));
+
+function otpauthUrl(issuer, account, secret) {
+  const label = encodeURIComponent(`${issuer}:${account}`);
+  return `otpauth://totp/${label}?secret=${secret}&issuer=${encodeURIComponent(issuer)}`
+    + "&algorithm=SHA1&digits=6&period=30";
+}
+
+const qrcodeLib = require("./lib/qrcode.js");
+
+/** Renders any text as a crisp SVG QR code (empty string on failure). */
+function qrSvg(text) {
+  try {
+    const qr = qrcodeLib(0, "M");
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    let cells = "";
+    for (let r = 0; r < n; r++)
+      for (let c = 0; c < n; c++)
+        if (qr.isDark(r, c)) cells += `<rect x="${c}" y="${r}" width="1" height="1"/>`;
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n} ${n}" shape-rendering="crispEdges">`
+      + `<rect width="${n}" height="${n}" fill="#ffffff"/><g fill="#000000">${cells}</g></svg>`;
+  } catch {
+    return "";
+  }
+}
+
 function parseCookies(req) {
   const out = {};
   const raw = req.headers.cookie;
@@ -1068,7 +1143,7 @@ route("POST", "/api/auth/register", async (req, res) => {
   if (!username || !password || !fullName) throw badRequest("جميع الحقول مطلوبة");
   if (!clinicName) throw badRequest("اسم العيادة مطلوب");
   if (username.length < 3) throw badRequest("اسم المستخدم يجب أن يكون ٣ أحرف على الأقل");
-  if (password.length < 6) throw badRequest("كلمة المرور يجب أن تكون ٦ أحرف على الأقل");
+  if (password.length < 8) throw badRequest("كلمة المرور يجب أن تكون ٨ أحرف على الأقل");
   if (db.users.some((u) => String(u.username).toLowerCase() === username.toLowerCase()))
     throw new AppError(409, "اسم المستخدم مستخدم بالفعل");
 
@@ -1124,7 +1199,7 @@ route("POST", "/api/auth/login", async (req, res) => {
 
   if (user.twoFactorEnabled && !b.trustDevice) {
     if (!b.twoFactorCode) return json(res, 200, { requiresTwoFactor: true, userId: user.id });
-    if (String(b.twoFactorCode) !== "123456") throw new AppError(401, "رمز التحقق غير صحيح");
+    if (!verifyTotp(user.twoFactorSecret, b.twoFactorCode)) throw new AppError(401, "رمز التحقق غير صحيح");
   }
 
   if (!user.twoFactorEnabled && b.trustDevice) {
@@ -1160,12 +1235,56 @@ route("POST", "/api/auth/logout", async (req, res) => {
   json(res, 200, { success: true });
 });
 
+/* ── TWO-FACTOR (TOTP) ── */
+
+route("GET", "/api/auth/2fa", async (req, res) => {
+  const s = requireSession(req);
+  json(res, 200, { enabled: !!s.user.twoFactorEnabled });
+});
+
+route("POST", "/api/auth/2fa/setup", async (req, res) => {
+  const s = requireSession(req);
+  if (s.user.twoFactorEnabled) throw badRequest("التحقق الثنائي مفعّل بالفعل");
+  const secret = newTotpSecret();
+  s.user.twoFactorPendingSecret = secret;
+  save();
+  const clinic = s.user.clinicId ? clinicOf(s.user.clinicId) : null;
+  const issuer = (clinic && clinic.name) || "Eyada";
+  const url = otpauthUrl(issuer, s.user.username, secret);
+  json(res, 200, { secret, otpauthUrl: url, qr: qrSvg(url) });
+});
+
+route("POST", "/api/auth/2fa/enable", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const secret = s.user.twoFactorPendingSecret;
+  if (!secret) throw badRequest("ابدأ إعداد التحقق الثنائي أولاً");
+  if (!verifyTotp(secret, b.code)) throw new AppError(400, "رمز التحقق غير صحيح");
+  s.user.twoFactorSecret = secret;
+  s.user.twoFactorEnabled = true;
+  delete s.user.twoFactorPendingSecret;
+  save();
+  json(res, 200, { enabled: true });
+});
+
+route("POST", "/api/auth/2fa/disable", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (s.user.twoFactorEnabled && !verifyTotp(s.user.twoFactorSecret, b.code))
+    throw new AppError(400, "رمز التحقق غير صحيح");
+  s.user.twoFactorEnabled = false;
+  delete s.user.twoFactorSecret;
+  delete s.user.twoFactorPendingSecret;
+  save();
+  json(res, 200, { enabled: false });
+});
+
 route("POST", "/api/auth/change-password", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
   const next = String(b.newPassword || "");
-  if (next.length < 6)
-    throw badRequest("كلمة المرور الجديدة يجب أن تكون 6 أحرف على الأقل");
+  if (next.length < 8)
+    throw badRequest("كلمة المرور الجديدة يجب أن تكون ٨ أحرف على الأقل");
   if (!verifyPassword(String(b.currentPassword || ""), s.user.password))
     throw badRequest("كلمة المرور الحالية غير صحيحة");
   if (verifyPassword(next, s.user.password))
@@ -1291,6 +1410,7 @@ route("GET", "/api/dashboard", async (req, res, p, url) => {
 route("GET", "/api/patients", async (req, res, p, url) => {
   requireSession(req);
   const clinicId = clinicScope(req, url);
+  ensurePatientFiles(clinicId);
   const search = (url.searchParams.get("search") || "").trim();
   const page = num(url.searchParams.get("page"), 1);
 
@@ -1298,7 +1418,9 @@ route("GET", "/api/patients", async (req, res, p, url) => {
   if (search) {
     const q = search.toLowerCase();
     list = list.filter(
-      (x) => String(x.fullName || "").toLowerCase().includes(q) || String(x.phone || "").includes(q)
+      (x) => String(x.fullName || "").toLowerCase().includes(q)
+        || String(x.phone || "").includes(q)
+        || String(x.fileNumber || "").toLowerCase().includes(q)
     );
   }
   list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
@@ -1311,12 +1433,35 @@ route("GET", "/api/patients", async (req, res, p, url) => {
 const PATIENT_FIELDS = ["fullName", "phone", "email", "gender", "age", "bloodType",
   "allergies", "insuranceNumber", "insuranceCompany", "notes"];
 
+/** رقم الملف: sequential per clinic (P-0001, P-0002 ...). */
+function nextPatientFileNumber(clinicId) {
+  let max = 0;
+  for (const p of db.patients) {
+    if (p.clinicId !== clinicId) continue;
+    const m = /(\d+)/.exec(String(p.fileNumber || ""));
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return "P-" + String(max + 1).padStart(4, "0");
+}
+
+/** Back-fill رقم الملف for rows created before the column existed, so the
+ *  patients table is never blank. Runs once per clinic. */
+function ensurePatientFiles(clinicId) {
+  const missing = db.patients
+    .filter((p) => p.clinicId === clinicId && !p.fileNumber)
+    .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+  if (!missing.length) return;
+  for (const p of missing) p.fileNumber = nextPatientFileNumber(clinicId);
+  save();
+}
+
 route("POST", "/api/patients", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
   if (!String(b.fullName || "").trim()) throw badRequest("يرجى إدخال اسم المريض");
+  const clinicId = b.clinicId || s.user.clinicId;
   const patient = {
-    id: uid("pat"), clinicId: b.clinicId || s.user.clinicId, fullName: b.fullName,
+    id: uid("pat"), clinicId, fileNumber: nextPatientFileNumber(clinicId), fullName: b.fullName,
     phone: b.phone || "", email: b.email || "", gender: b.gender || "",
     age: b.age === "" || b.age == null ? "" : num(b.age),
     bloodType: b.bloodType || "", allergies: b.allergies || "",
@@ -1522,7 +1667,7 @@ route("POST", "/api/users", async (req, res) => {
   const username = String(b.username || "").trim();
   const password = String(b.password || "");
   if (!username || !b.fullName) throw badRequest("اسم المستخدم والاسم الكامل مطلوبان");
-  if (password.length < 6) throw badRequest("كلمة المرور يجب أن تكون ٦ أحرف على الأقل");
+  if (password.length < 8) throw badRequest("كلمة المرور يجب أن تكون ٨ أحرف على الأقل");
   if (db.users.some((u) => String(u.username).toLowerCase() === username.toLowerCase()))
     throw new AppError(409, "اسم المستخدم مستخدم بالفعل");
 
@@ -1598,7 +1743,7 @@ route("PUT", "/api/users", async (req, res) => {
   for (const k of ["fullName", "phone", "email", "twoFactorEnabled"])
     if (b[k] !== undefined) user[k] = b[k];
   if (b.password) {
-    if (String(b.password).length < 6) throw badRequest("كلمة المرور يجب أن تكون ٦ أحرف على الأقل");
+    if (String(b.password).length < 8) throw badRequest("كلمة المرور يجب أن تكون ٨ أحرف على الأقل");
     user.password = hashPassword(b.password);
   }
   save();

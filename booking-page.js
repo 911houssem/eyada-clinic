@@ -520,6 +520,7 @@ var I = {
   sun:'<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.4v2M12 19.6v2M4.2 4.2l1.5 1.5M18.3 18.3l1.5 1.5M2.4 12h2M19.6 12h2M4.2 19.8l1.5-1.5M18.3 5.7l1.5-1.5"/></svg>',
   moon:'<svg class="ic" viewBox="0 0 24 24"><path d="M20 14.6A8.2 8.2 0 0 1 9.4 4 8.3 8.3 0 1 0 20 14.6Z"/></svg>',
   check:'<svg class="ic" viewBox="0 0 24 24"><path d="m5 12.5 4.4 4.4L19 7"/></svg>',
+  clinic:'<svg class="ic" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M12 8.5v7M8.5 12h7"/></svg>',
   tooth:'<svg viewBox="0 0 24 24"><path d="M8.2 3.5C6.1 3.5 4.6 5.1 4.6 7.6c0 2 .6 3.2 1 5 .3 1.4.3 2.6.6 4 .2 1 .6 1.9 1.3 1.9.9 0 .9-1.6 1.2-3 .2-1 .5-1.7 1.3-1.7s1.1.7 1.3 1.7c.3 1.4.3 3 1.2 3 .7 0 1.1-.9 1.3-1.9.3-1.4.3-2.6.6-4 .4-1.8 1-3 1-5 0-2.5-1.5-4.1-3.6-4.1-1.2 0-1.8.6-2.4.6s-1.2-.6-2.4-.6Z"/></svg>',
   spark:'<svg class="ic" viewBox="0 0 24 24"><path d="M12 3v3.5M12 17.5V21M3 12h3.5M17.5 12H21M5.6 5.6l2.5 2.5M15.9 15.9l2.5 2.5M18.4 5.6l-2.5 2.5M8.1 15.9l-2.5 2.5"/></svg>',
   shield:'<svg class="ic" viewBox="0 0 24 24"><path d="M12 3l7 2.8V11c0 4.6-3 8.3-7 10-4-1.7-7-5.4-7-10V5.8L12 3Z"/></svg>',
@@ -600,7 +601,7 @@ function summaryHTML(){
   h += row2("اليوم والوقت", esc(when));
   h += '<div class="total"><span>الإجمالي المتوقع</span><b>' + (s ? esc(money(s.price)) : "—") + '</b></div>';
   h += '<button type="submit" form="f" class="cta" id="send">' + I.check + '<span>تأكيد الحجز</span></button>';
-  h += '<p class="tip">الأسعار تقديرية ويتم تثبيتها عند تأكيد الحجز. الحجز عبر الموقع مجاني، ويصبح الموعد نهائياً بعد مكالمة التأكيد.</p>';
+  h += '<p class="tip">الأسعار المعروضة تقديرية وقد تتغيّر. الحجز عبر الموقع لا يتطلّب أي دفع، ويُثبَّت السعر والموعد نهائياً عند مكالمة التأكيد من العيادة.</p>';
   h += '<div class="trust"><span>' + I.shield + ' بيانات محمية</span><span>' + I.clock + ' تأكيد سريع</span><span>' + I.ics + ' إضافة للتقويم</span></div>';
   return h;
 }
@@ -635,7 +636,7 @@ function serviceCards(){
     var s=state.services[i], sel=(state.serviceId===s.id);
     out += '<label class="svc' + (sel?' sel':'') + '" data-id="' + s.id + '">' +
       '<input type="radio" name="svc" value="' + s.id + '"' + (sel?' checked':'') + '>' +
-      '<div class="svc-top"><span class="svc-ic">' + I.tooth + '</span><span class="tick">' + I.check + '</span></div>' +
+      '<div class="svc-top"><span class="svc-ic">' + I.clinic + '</span><span class="tick">' + I.check + '</span></div>' +
       '<span class="nm">' + esc(s.name) + '</span>' +
       (s.description ? '<span class="ds">' + esc(s.description) + '</span>' : '') +
       '<span class="chips"><span class="chip">' + I.clock + ' ' + esc(mins(s.durationMin)) + '</span>' +
