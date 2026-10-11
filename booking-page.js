@@ -869,7 +869,11 @@ function submit(ev){
   })
   .then(function(r){ return r.json().then(function(d){ return { ok:r.ok, status:r.status, d:d }; }); })
   .then(function(r){
-    if(!r.ok){ if (r.status === 409) loadSlots(); throw new Error((r.d && r.d.error) || "تعذّر إتمام الحجز"); }
+    if(!r.ok){
+      if (r.status === 423) { renderClosed((r.d && r.d.error) || "", ""); return; }
+      if (r.status === 409) loadSlots();
+      throw new Error((r.d && r.d.error) || "تعذّر إتمام الحجز");
+    }
     done(r.d);
   })
   .catch(function(e){
@@ -954,6 +958,25 @@ $("#bbbtn").addEventListener("click", function(){
   if(f.requestSubmit) f.requestSubmit(); else f.dispatchEvent(new Event("submit", { cancelable:true }));
 });
 
+/* ── closed page: clinic staff stopped the public site ── */
+function renderClosed(msg, until){
+  document.querySelector("main .wrap").classList.add("single");
+  var nm = (state.clinic && state.clinic.name) || D.name || "";
+  var body = msg ? esc(msg) : ("عيادة " + esc(nm) + " أوقفت الحجز عبر الموقع مؤقتاً.");
+  var untilHtml = until ? '<p class="muted">يعود الموقع للعمل بتاريخ ' + esc(until) + '.</p>' : '';
+  var phoneHtml = (state.clinic && state.clinic.phone)
+    ? '<p class="tip">للتواصل مع العيادة: <strong><a href="tel:' + esc(state.clinic.phone) + '">' + esc(state.clinic.phone) + '</a></strong></p>'
+    : '';
+  $("#wrap").innerHTML =
+    '<div class="card off">' +
+      '<div class="seal"><span class="ring"></span><svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/></svg></div>' +
+      '<h1>الموقع مغلق مؤقتاً</h1>' +
+      '<p class="muted">' + body + '</p>' + untilHtml + phoneHtml +
+    '</div>';
+  var bar=$("#bottombar"); if(bar) bar.classList.remove("show");
+  var strip=$("#hstrip"); if(strip) strip.innerHTML="";
+}
+
 /* ── boot ── */
 function boot(){
   fetch(API)
@@ -973,6 +996,8 @@ function boot(){
       if(state.clinic.address) meta.push('<span>' + I.pin + ' ' + esc(state.clinic.address) + '</span>');
       if(state.clinic.phone) meta.push('<a href="tel:' + esc(state.clinic.phone) + '">' + I.phone + ' ' + esc(state.clinic.phone) + '</a>');
       $("#hmeta").innerHTML = meta.join("");
+
+      if(d.closed){ renderClosed(d.closedMessage, d.closedUntil); return; }
 
       var strip=[I.check + " تأكيد الموعد فوراً", I.clock + " مواعيد من ٨ صباحاً حتى ١٠ مساءً", I.shield + " بياناتك محفوظة"];
       $("#hstrip").innerHTML = strip.map(function(x){ return "<span>" + x + "</span>"; }).join("");

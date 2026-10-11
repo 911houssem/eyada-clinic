@@ -1365,7 +1365,10 @@ route("POST", "/api/clinics", async (req, res) => {
     currency: b.currency || "SAR",
     paymentMode: b.paymentMode || "postpaid",
     ownerId: s.user.id, bookingSlug: uniqueBookingSlug(b.name),
-    bookingEnabled: b.bookingEnabled !== false, createdAt: now(),
+    bookingEnabled: b.bookingEnabled !== false,
+    siteClosed: false, siteClosedMessage: "", siteClosedUntil: "",
+    siteClosedAt: "", siteClosedBy: "",
+    createdAt: now(),
   };
   db.clinics.push(clinic);
   seedDefaultServices(clinic.id);
@@ -1393,6 +1396,18 @@ route("PUT", "/api/clinics", async (req, res) => {
     }
   }
   if (!clinic.bookingSlug) clinic.bookingSlug = uniqueBookingSlug(clinic.name);
+  // "إغلاق الموقع": clinic staff can take their public booking site offline
+  // (holidays, full schedule, maintenance) with an optional notice + reopen date.
+  if (b.siteClosedMessage !== undefined) clinic.siteClosedMessage = String(b.siteClosedMessage || "").slice(0, 500);
+  if (b.siteClosedUntil !== undefined) clinic.siteClosedUntil = String(b.siteClosedUntil || "").slice(0, 40);
+  if (b.siteClosed !== undefined) {
+    const closed = !!b.siteClosed;
+    if (closed !== !!clinic.siteClosed) {
+      clinic.siteClosedAt = closed ? now() : "";
+      clinic.siteClosedBy = closed ? (s.user.fullName || s.user.username || "") : "";
+    }
+    clinic.siteClosed = closed;
+  }
   save();
   json(res, 200, clinic);
 });
@@ -2380,6 +2395,19 @@ function requireBookable(slug) {
   return clinic;
 }
 
+/** Present when clinic staff have closed the public site, else null. */
+function bookingClosure(clinic) {
+  if (!clinic || !clinic.siteClosed) return null;
+  return {
+    message: String(clinic.siteClosedMessage || ""),
+    until: String(clinic.siteClosedUntil || ""),
+    by: String(clinic.siteClosedBy || ""),
+    at: String(clinic.siteClosedAt || ""),
+  };
+}
+
+const SITE_CLOSED_MSG = "الموقع مغلق مؤقتاً — يرجى التواصل مع العيادة مباشرةً";
+
 const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
 /** The clinic's active bookable menu, ordered for display. */
@@ -2476,11 +2504,15 @@ function pickService(clinic, serviceId) {
 route("GET", "/api/public/booking/:slug", async (req, res, p) => {
   const clinic = requireBookable(p.slug);
   res.setHeader("Cache-Control", "no-store");
+  const closure = bookingClosure(clinic);
   json(res, 200, {
     clinic: {
       name: clinic.name, address: clinic.address || "", phone: clinic.phone || "",
       currency: clinic.currency || "SAR",
     },
+    closed: !!closure,
+    closedMessage: closure ? closure.message : "",
+    closedUntil: closure ? closure.until : "",
     services: clinicServices(clinic).map((s) => serviceForClient(clinic, s)),
     doctors: db.users
       .filter((u) => u.clinicId === clinic.id && ["doctor", "nurse"].includes(u.role))
@@ -2492,6 +2524,8 @@ route("GET", "/api/public/booking/:slug", async (req, res, p) => {
 route("GET", "/api/public/booking/:slug/slots", async (req, res, p, url) => {
   const clinic = requireBookable(p.slug);
   res.setHeader("Cache-Control", "no-store");
+  if (clinic.siteClosed)
+    return json(res, 200, { closed: true, date: url.searchParams.get("date") || "", durationMin: DEFAULT_APPTMENT_MIN, next: null, slots: [] });
   const date = url.searchParams.get("date") || ymd(new Date());
   const doctorId = url.searchParams.get("doctorId") || "";
   const service = pickService(clinic, url.searchParams.get("serviceId"));
@@ -2508,6 +2542,8 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
   throttleBooking(req);
   const clinic = requireBookable(p.slug);
   const b = await readBody(req);
+  if (clinic.siteClosed)
+    throw new AppError(423, bookingClosure(clinic)?.message || SITE_CLOSED_MSG);
 
   const name = String(b.patientName || b.name || "").trim();
   const phone = String(b.phone || "").trim();
