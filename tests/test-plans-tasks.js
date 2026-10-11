@@ -7,7 +7,7 @@ const path = require("path");
 const http = require("http");
 const fs = require("fs");
 const ROOT = path.join(__dirname, "..");
-const DB = ROOT + "\\data\\db.json";
+const DB = path.join(ROOT, "data", "db.json");
 
 let pass = 0, fail = 0;
 const check = (name, cond, extra = "") => {
