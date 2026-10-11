@@ -64,6 +64,10 @@ const LIMITS = {
   backupKeep: 14, // rotate: keep the newest N snapshots
   trashTtlMs: Number(process.env.TRASH_TTL_DAYS || 30) * 24 * 60 * 60 * 1000, // soft-deleted rows purge after this
   resetTtlMs: 30 * 60 * 1000, // password-reset link lifetime
+  queueSweepMs: 20 * 1000, // notification-queue worker cadence
+  reminderSweepMs: 60 * 1000, // reminder scan cadence
+  notifMaxAttempts: Number(process.env.NOTIFY_MAX_ATTEMPTS || 3), // tries per queued message
+  notifRatePerMin: Number(process.env.NOTIFY_RATE_PER_MIN || 30), // per-clinic send ceiling
 };
 
 /* ══════════════════════════ 2. LOGGING ══════════════════════════ */
@@ -179,6 +183,9 @@ const SENSITIVE_FIELDS = {
   // (or in the rotated backups). Legacy plaintext values are sealed on the first
   // save after upgrade — sealValue() skips anything already prefixed.
   users: ["twoFactorSecret", "twoFactorPendingSecret"],
+  // Provider credentials (WhatsApp Cloud token, webhook HMAC secret, SMTP
+  // password) are sealed exactly like medical data and never echoed by the API.
+  notificationConfigs: ["whatsappToken", "webhookSecret", "smtpPassword"],
 };
 
 function sealValue(v) {
@@ -469,6 +476,7 @@ const EMPTY = {
   users: [], clinics: [], patients: [], appointments: [], invoices: [],
   tasks: [], records: [], inventory: [], messages: [], services: [],
   plans: [], clinicSubscriptions: [], offers: [], auditLog: [],
+  notificationConfigs: [], notificationQueue: [], notificationLog: [],
 };
 
 /**

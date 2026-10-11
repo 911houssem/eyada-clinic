@@ -17,6 +17,9 @@
 
 const providers = {
   console: require("./console"),
+  "whatsapp-cloud": require("./whatsapp"),
+  webhook: require("./webhook"),
+  smtp: require("./smtp"),
 };
 
 const DEFAULT_CHANNEL = process.env.NOTIFY_CHANNEL || "console";
@@ -25,7 +28,11 @@ function get(name) {
   return providers[name] || null;
 }
 
-async function send({ channel, to, templateKey, vars, clinicId } = {}) {
+function has(name) {
+  return !!providers[name];
+}
+
+async function send({ channel, to, templateKey, vars, clinicId, config } = {}) {
   const ch = channel || DEFAULT_CHANNEL;
   const provider = get(ch);
   if (!provider) {
@@ -33,7 +40,7 @@ async function send({ channel, to, templateKey, vars, clinicId } = {}) {
     return { ok: false, provider: null, reason: "no-provider" };
   }
   try {
-    const r = await provider.send({ to, templateKey, vars, clinicId });
+    const r = await provider.send({ to, templateKey, vars, clinicId, config });
     return r || { ok: true, provider: ch };
   } catch (e) {
     console.error(`[notify] provider "${ch}" failed:`, (e && e.message) || e);
@@ -41,4 +48,4 @@ async function send({ channel, to, templateKey, vars, clinicId } = {}) {
   }
 }
 
-module.exports = { send, get, providers, DEFAULT_CHANNEL };
+module.exports = { send, get, has, providers, DEFAULT_CHANNEL };
