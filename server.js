@@ -18,6 +18,7 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
+const notify = require("./notifiers");
 
 /* ══════════════════════════ 1. CONFIG ══════════════════════════ */
 
@@ -34,6 +35,7 @@ const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : pat
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const TMP_FILE = path.join(DATA_DIR, "db.json.tmp");
 const SESSIONS_FILE = path.join(DATA_DIR, "sessions.json");
+const RESETS_FILE = path.join(DATA_DIR, "resets.json");
 const AUDIT_FILE = path.join(DATA_DIR, "audit.log");
 const BACKUP_DIR = path.join(DATA_DIR, "backups");
 
@@ -42,6 +44,7 @@ const argOf = (name) => {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
 };
+const CREATE_OWNER = argv.includes("--create-owner");
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || argOf("port") || 3000);
@@ -59,6 +62,8 @@ const LIMITS = {
   sessionSweepMs: 10 * 60 * 1000, // sweep every 10 minutes
   backupIntervalMs: 6 * 60 * 60 * 1000, // auto-backup every 6 hours
   backupKeep: 14, // rotate: keep the newest N snapshots
+  trashTtlMs: Number(process.env.TRASH_TTL_DAYS || 30) * 24 * 60 * 60 * 1000, // soft-deleted rows purge after this
+  resetTtlMs: 30 * 60 * 1000, // password-reset link lifetime
 };
 
 /* ══════════════════════════ 2. LOGGING ══════════════════════════ */
@@ -82,6 +87,7 @@ function toFile(line) {
     const f = path.join(DATA_DIR, "server.log");
     if (fs.existsSync(f) && fs.statSync(f).size > 2 * 1024 * 1024) fs.renameSync(f, f + ".1");
     fs.appendFileSync(f, `${line}\n`);
+    if (IS_PROD) chmodSafe(f, 0o600);
   } catch {
     /* logging must never take the server down */
   }
@@ -120,6 +126,7 @@ function audit(req, action, meta = {}) {
     if (fs.existsSync(AUDIT_FILE) && fs.statSync(AUDIT_FILE).size > AUDIT_MAX_BYTES)
       fs.renameSync(AUDIT_FILE, AUDIT_FILE + ".1");
     fs.appendFileSync(AUDIT_FILE, JSON.stringify(entry) + "\n");
+    if (IS_PROD) chmodSafe(AUDIT_FILE, 0o600);
   } catch {
     /* auditing must never break a request */
   }
@@ -136,6 +143,7 @@ function runBackup(reason = "scheduled") {
     const name = `db-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
     const dest = path.join(BACKUP_DIR, name);
     fs.copyFileSync(DB_FILE, dest);
+    if (IS_PROD) chmodSafe(dest, 0o600);
     const files = fs
       .readdirSync(BACKUP_DIR)
       .filter((f) => f.startsWith("db-") && f.endsWith(".json"))
@@ -167,6 +175,10 @@ const encKey = ENCRYPTION_KEY
 const SENSITIVE_FIELDS = {
   patients: ["bloodType", "allergies"],
   records: ["chiefComplaint", "diagnosis", "treatment", "notes"],
+  // The TOTP seed is a live second factor: it must never sit in db.json in clear
+  // (or in the rotated backups). Legacy plaintext values are sealed on the first
+  // save after upgrade — sealValue() skips anything already prefixed.
+  users: ["twoFactorSecret", "twoFactorPendingSecret"],
 };
 
 function sealValue(v) {
@@ -197,6 +209,27 @@ function mapSensitive(obj, fn) {
     for (const row of rows) for (const f of fields) if (typeof row[f] === "string" && row[f]) row[f] = fn(row[f]);
   }
   return obj;
+}
+
+/* ── Filesystem permissions ──
+ * A production deploy must not leave db.json / sessions.json / audit.log / the
+ * backups world-readable. Best effort: chmod is a no-op-ish on Windows (only the
+ * read-only bit is honoured) and may fail on exotic filesystems, so every call
+ * is swallowed. Only applied in production so dev + the test suite are untouched.
+ */
+function chmodSafe(p, mode) {
+  try { fs.chmodSync(p, mode); } catch { /* best effort */ }
+}
+
+function hardenPerms() {
+  if (!IS_PROD) return;
+  chmodSafe(DATA_DIR, 0o700);
+  for (const f of [DB_FILE, TMP_FILE, SESSIONS_FILE, AUDIT_FILE, path.join(DATA_DIR, "server.log")])
+    if (fs.existsSync(f)) chmodSafe(f, 0o600);
+  try {
+    if (fs.existsSync(BACKUP_DIR))
+      for (const f of fs.readdirSync(BACKUP_DIR)) chmodSafe(path.join(BACKUP_DIR, f), 0o600);
+  } catch { /* best effort */ }
 }
 
 /* ══════════════════════════ 3. ERRORS ══════════════════════════ */
@@ -462,11 +495,9 @@ function seedDefaultServices(clinicId) {
 
 const AR_MONTHS = ["يناير","فبراير","مارس","أبريل","مايو","يونيو","يوليو","أغسطس","سبتمبر","أكتوبر","نوفمبر","ديسمبر"];
 
-function seed() {
-  const nowIso = now();
-  const clinicId = uid("clinic");
-
-  const plans = [
+/** The subscription catalogue. Fresh objects (new ids) on every call. */
+function defaultPlans() {
+  return [
     { id: uid("plan"), name: "الأساسية", description: "مثالية للعيادة الواحدة التي بدأت رحلتها",
       price: 199, yearlyPrice: 1990, maxPatients: 500, maxDoctors: 2, maxClinics: 1,
       isPopular: false, isActive: true, sortOrder: 0,
@@ -480,6 +511,13 @@ function seed() {
       isPopular: false, isActive: true, sortOrder: 2,
       features: ["كل مزايا الخطة الاحترافية","إدارة متعددة العيادات","صلاحيات متقدمة لكل فرع","تقارير مالية مفصّلة","محادثة داخلية بين الفرق","مدير حساب مخصص"] },
   ];
+}
+
+function seed() {
+  const nowIso = now();
+  const clinicId = uid("clinic");
+
+  const plans = defaultPlans();
 
   const mkUser = (username, password, fullName, phone, email, role) => ({
     id: uid("user"), username, password: hashPassword(password), fullName,
@@ -579,6 +617,33 @@ function seed() {
       endDate: new Date(Date.now() + 365 * 864e5).toISOString(), trialEndDate: null,
       billingCycle: "monthly", notes: "",
     }],
+  };
+}
+
+/**
+ * A production database starts EMPTY except for the subscription catalogue.
+ * No demo clinic, no demo patients/appointments, and — critically — no
+ * well-known demo accounts. The first site owner is created separately from
+ * operator-supplied credentials (OWNER_USERNAME / OWNER_PASSWORD or
+ * `node server.js --create-owner`).
+ */
+function seedProduction() {
+  return { ...EMPTY, plans: defaultPlans() };
+}
+
+/** The first site owner, built from OWNER_* env vars (null when unset). */
+function makeOwnerFromEnv() {
+  const username = String(process.env.OWNER_USERNAME || "").trim();
+  const password = process.env.OWNER_PASSWORD || "";
+  if (!username || !password) return null;
+  checkPasswordPolicy(password);
+  return {
+    id: uid("user"), username, password: hashPassword(password),
+    fullName: String(process.env.OWNER_NAME || "مالك الموقع").trim() || "مالك الموقع",
+    phone: String(process.env.OWNER_PHONE || "").trim(),
+    email: String(process.env.OWNER_EMAIL || "").trim(),
+    role: "super_admin", clinicId: null, permissions: {},
+    twoFactorEnabled: false, trustedDevices: [], createdAt: now(),
   };
 }
 
@@ -701,20 +766,30 @@ const SAFE_SLUG = /^[a-z0-9][a-z0-9-]*$/;
 
   // clinics need a helpdesk account to talk to
   if (!db.users.some((u) => u.role === "support")) {
+    // In production the helpdesk account gets an unguessable password that is
+    // never logged (the owner can reset it from the admin UI if needed). In dev
+    // it keeps the familiar support/support123 so the demo stays usable.
+    const pw = IS_PROD ? crypto.randomBytes(24).toString("base64url") : "support123";
     db.users.push({
-      id: uid("user"), username: "support", password: hashPassword("support123"),
+      id: uid("user"), username: "support", password: hashPassword(pw),
       fullName: "الدعم الفني", phone: "", email: "support@eyada.local",
       role: "support", clinicId: null, permissions: {},
       twoFactorEnabled: false, trustedDevices: [], createdAt: now(),
     });
-    notes.push("created support account (support / support123)");
+    notes.push(IS_PROD ? "created helpdesk account (support; password not logged)"
+      : "created support account (support / support123)");
   }
+
+  // soft-delete migration: give every trashable row explicit deletedAt/deletedBy
+  const soft = migrateSoftDelete();
+  if (soft) notes.push(`soft-delete: initialised deletedAt on ${soft} row(s)`);
 
   return notes;
 }
 
 function load() {
   loadSessions();
+  loadResets();
   try {
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, "utf8");
@@ -747,27 +822,35 @@ function load() {
     fail("db.json unreadable, reseeding:", e.message);
     try { fs.renameSync(DB_FILE, `${DB_FILE}.corrupt-${Date.now()}`); } catch { /* best effort */ }
   }
-  db = normalize(seed());
-  migrate();
   if (IS_PROD) {
-    // Never ship the well-known demo passwords (admin/admin123 ...) in production:
-    // mint strong random ones (or use SEED_PASSWORD) and log them once.
-    const forced = process.env.SEED_PASSWORD;
-    for (const u of db.users) {
-      const pw = forced || crypto.randomBytes(12).toString("base64url");
-      u.password = hashPassword(pw);
-      log(`generated seed credentials — ${u.username} / ${pw}`);
+    // Production never seeds a demo clinic or demo accounts. Start from the
+    // empty-but-catalogued database, add the owner from OWNER_* env if present,
+    // and refuse to boot without a site owner (unless we are about to create one).
+    db = normalize(seedProduction());
+    let owner = null;
+    try { owner = makeOwnerFromEnv(); }
+    catch (e) { fail("OWNER_PASSWORD rejected:", e.message); process.exit(1); }
+    if (owner) { db.users.push(owner); log(`seeded site owner from OWNER_* env — ${owner.username}`); }
+    migrate();
+    if (!db.users.some((u) => u.role === "super_admin") && !CREATE_OWNER) {
+      fail("production has no site owner. Set OWNER_USERNAME + OWNER_PASSWORD (min 12 chars),");
+      fail("or run: node server.js --create-owner");
+      process.exit(1);
     }
-    warn("seeded demo data in production: change or delete the demo accounts before going live");
+    save(true);
+    log("production database initialised (empty — no demo data)");
+  } else {
+    db = normalize(seed());
+    migrate();
+    save(true);
+    log("database seeded with demo data");
   }
-  save(true);
-  log("database seeded with demo data");
 }
 
 /** Debounced + atomic (write to .tmp then rename) so a crash mid-write can't corrupt it. */
 let saveTimer = null;
-let saving = false;
-let saveAgain = false;
+let flushing = null;   // in-flight write promise (so callers can await persistence)
+let dirtyAgain = false;
 
 function save(immediate = false) {
   if (immediate) return flush();
@@ -777,26 +860,38 @@ function save(immediate = false) {
   return undefined;
 }
 
+/**
+ * Serialized, awaitable write. A caller that arrives mid-write waits for it and
+ * then persists its own state, so `await save(true)` in a short-lived process
+ * (e.g. --create-owner) is guaranteed to have landed before exit.
+ */
 async function flush() {
-  if (saving) { saveAgain = true; return; }
-  saving = true;
-  let handle = null;
-  try {
-    await fsp.mkdir(DATA_DIR, { recursive: true });
-    handle = await fsp.open(TMP_FILE, "w");
-    const out = encKey ? mapSensitive(structuredClone(db), sealValue) : db;
-    await handle.writeFile(JSON.stringify(out, null, 2), "utf8");
-    await handle.sync(); // flush to disk before the rename, so a power cut can't leave a renamed-but-empty file
-    await handle.close();
-    handle = null;
-    await fsp.rename(TMP_FILE, DB_FILE); // atomic on Windows + POSIX
-  } catch (e) {
-    fail("could not persist database:", e.message);
-  } finally {
-    if (handle) { try { await handle.close(); } catch { /* already closed */ } }
-    saving = false;
-    if (saveAgain) { saveAgain = false; save(); }
+  if (flushing) {
+    dirtyAgain = true;
+    try { await flushing; } catch { /* the first writer reported it */ }
+    if (dirtyAgain) { dirtyAgain = false; return flush(); }
+    return;
   }
+  dirtyAgain = false;
+  flushing = (async () => {
+    let handle = null;
+    try {
+      await fsp.mkdir(DATA_DIR, { recursive: true });
+      handle = await fsp.open(TMP_FILE, "w");
+      const out = encKey ? mapSensitive(structuredClone(db), sealValue) : db;
+      await handle.writeFile(JSON.stringify(out, null, 2), "utf8");
+      await handle.sync(); // flush to disk before the rename, so a power cut can't leave a renamed-but-empty file
+      await handle.close();
+      handle = null;
+      await fsp.rename(TMP_FILE, DB_FILE); // atomic on Windows + POSIX
+      hardenPerms();
+    } catch (e) {
+      fail("could not persist database:", e.message);
+    } finally {
+      if (handle) { try { await handle.close(); } catch { /* already closed */ } }
+    }
+  })();
+  try { await flushing; } finally { flushing = null; }
 }
 
 /* ══════════════════════════ 6. SESSIONS ══════════════════════════
@@ -844,6 +939,7 @@ function saveSessions() {
       const tmp = SESSIONS_FILE + ".tmp";
       fs.writeFileSync(tmp, JSON.stringify(sessions), "utf8");
       fs.renameSync(tmp, SESSIONS_FILE);
+      hardenPerms();
     } catch (e) { fail("could not persist sessions:", e.message); }
   }, 80);
   if (sessionsTimer.unref) sessionsTimer.unref();
@@ -1043,6 +1139,56 @@ function recordLoginFailure(req, username) {
 }
 
 function clearLoginFailures(req, username) { loginAttempts.delete(loginKey(req, username)); }
+
+/* ── Password-reset tokens (hashed at rest, single use, short TTL) ── */
+
+let resets = {};
+
+function loadResets() {
+  if (!fs.existsSync(RESETS_FILE)) return;
+  try { resets = JSON.parse(fs.readFileSync(RESETS_FILE, "utf8")) || {}; }
+  catch { resets = {}; }
+}
+
+let resetsTimer = null;
+function saveResets() {
+  clearTimeout(resetsTimer);
+  resetsTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const tmp = RESETS_FILE + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(resets), "utf8");
+      fs.renameSync(tmp, RESETS_FILE);
+      hardenPerms();
+    } catch (e) { fail("could not persist reset tokens:", e.message); }
+  }, 80);
+  if (resetsTimer.unref) resetsTimer.unref();
+}
+
+/** Drops used/expired reset tokens; returns how many were removed. */
+function pruneResets() {
+  const t = Date.now();
+  let removed = 0;
+  for (const [h, r] of Object.entries(resets)) {
+    if (!r || r.usedAt || (Date.parse(r.expiresAt) || 0) < t) { delete resets[h]; removed++; }
+  }
+  return removed;
+}
+
+/** Rate limit reset requests per IP + account (uniform 429). */
+const resetRequests = new Map();
+const RESET_MAX = Number(process.env.RESET_MAX || (IS_PROD ? 5 : 50));
+const RESET_WINDOW_MS = 15 * 60 * 1000;
+
+function assertResetAllowed(req, account) {
+  const key = `${clientIp(req)}|${String(account || "").toLowerCase()}`;
+  const r = resetRequests.get(key) || { count: 0, until: 0 };
+  if (r.until <= Date.now()) { r.count = 0; r.until = Date.now() + RESET_WINDOW_MS; }
+  r.count++;
+  resetRequests.set(key, r);
+  if (r.count > RESET_MAX)
+    throw new AppError(429, "طلبات كثيرة. حاول مرة أخرى بعد قليل.");
+}
 
 /**
  * Clinic owner = "admin" (صاحب عيادة). Site owner = "super_admin" (مالك الموقع).
@@ -1272,7 +1418,7 @@ function enforceSubscription(req, urlPath) {
  *  other route — including any added in the future — is deny-by-default and
  *  must carry a valid session, even if it is not listed in PERMISSION_RULES. */
 const PUBLIC_API = [
-  /^\/api\/auth\/(?:register|login|logout)$/,
+  /^\/api\/auth\/(?:register|login|logout|forgot|reset)$/,
   /^\/api\/health$/,
   /^\/api\/public\//,
   /^\/api\/subscriptions\/?$/,
@@ -1372,7 +1518,9 @@ function uniqueBookingSlug(name) {
 
 const publicUser = (u) => {
   if (!u) return null;
-  const { password, trustedDevices, permissions, ...rest } = u;
+  // Never let a credential reach the client: the scrypt hash, the TOTP seeds
+  // (pending setup + enabled), and the device list all stay server-side.
+  const { password, twoFactorSecret, twoFactorPendingSecret, trustedDevices, permissions, ...rest } = u;
   return {
     ...rest,
     roleLabel: ROLE_LABELS[u.role] || u.role,
@@ -1434,9 +1582,9 @@ function buildDashboard(clinicId, empty) {
   const clinic = empty ? null : clinicOf(clinicId) || db.clinics[0];
   const cid = clinic ? clinic.id : null;
 
-  const patients = db.patients.filter((p) => p.clinicId === cid);
-  const appts = db.appointments.filter((a) => a.clinicId === cid);
-  const invoices = db.invoices.filter((i) => i.clinicId === cid);
+  const patients = db.patients.filter((p) => p.clinicId === cid && isLive(p));
+  const appts = db.appointments.filter((a) => a.clinicId === cid && isLive(a));
+  const invoices = db.invoices.filter((i) => i.clinicId === cid && isLive(i));
 
   const today = new Date();
   const todayAppointments = appts
@@ -1614,6 +1762,110 @@ route("POST", "/api/auth/logout", async (req, res) => {
   clearSession(req, res);
   audit(req, "logout", { actorId: s && s.user.id, username: s && s.user.username });
   json(res, 200, { success: true });
+});
+
+/* ── Password reset (forgot / reset / logout-all) ── */
+
+/** Public base URL used to build reset links (no trailing slash). */
+function publicBaseUrl() {
+  return String(process.env.PUBLIC_URL || process.env.ORIGIN || "").replace(/\/+$/, "")
+    || `http://${HOST}:${PORT}`;
+}
+
+function findUserByAccount(account) {
+  const a = String(account || "").trim().toLowerCase();
+  if (!a) return null;
+  return db.users.find(
+    (u) => String(u.username).toLowerCase() === a
+      || (u.email && String(u.email).toLowerCase() === a)
+      || (u.phone && String(u.phone) === a)
+  ) || null;
+}
+
+route("POST", "/api/auth/forgot", async (req, res) => {
+  const b = await readBody(req);
+  const account = b.username || b.email || b.account || "";
+  assertResetAllowed(req, account);
+
+  const user = findUserByAccount(account);
+  // Always do comparable work + always return the same body so the endpoint
+  // cannot be used to enumerate accounts (or their existence) by timing/response.
+  const genericOk = { success: true, message: "إن كان الحساب موجوداً فستصلك رسالة لإعادة تعيين كلمة المرور." };
+
+  if (user) {
+    pruneResets();
+    const token = crypto.randomBytes(32).toString("hex");
+    resets[sha256(token)] = {
+      userId: user.id,
+      createdAt: now(),
+      expiresAt: new Date(Date.now() + LIMITS.resetTtlMs).toISOString(),
+      usedAt: null,
+    };
+    saveResets();
+    const link = `${publicBaseUrl()}/?resetToken=${token}`;
+    // Delivered through the notifier abstraction, never inline.
+    const result = await notify.send({
+      channel: process.env.NOTIFY_CHANNEL || "console",
+      to: user.email || user.phone || user.username,
+      templateKey: "password_reset",
+      clinicId: user.clinicId || null,
+      vars: { name: user.fullName || user.username, link, ttlMinutes: Math.round(LIMITS.resetTtlMs / 60000) },
+    });
+    if (!result || !result.ok) log(`reset link for ${user.username}: ${link}`);
+    audit(req, "password.reset.request", { actorId: user.id, username: user.username });
+  } else {
+    // burn roughly the same CPU as the real branch (scrypt) to level timing
+    hashPassword(crypto.randomBytes(12).toString("hex"));
+    audit(req, "password.reset.request", { username: account, detail: "unknown-account" });
+  }
+  json(res, 200, genericOk);
+});
+
+route("POST", "/api/auth/reset", async (req, res) => {
+  const b = await readBody(req);
+  const token = String(b.token || "");
+  const next = String(b.newPassword || b.password || "");
+  checkPasswordPolicy(next);
+  if (!token) throw badRequest("رمز إعادة التعيين مطلوب");
+
+  const hash = sha256(token);
+  const rec = resets[hash];
+  if (!rec || rec.usedAt || (Date.parse(rec.expiresAt) || 0) < Date.now())
+    throw new AppError(400, "رابط إعادة التعيين غير صالح أو منتهي الصلاحية");
+
+  const user = db.users.find((u) => u.id === rec.userId);
+  if (!user) throw new AppError(400, "رابط إعادة التعيين غير صالح أو منتهي الصلاحية");
+
+  // If 2FA is on, the reset alone is not enough: require a current TOTP code so
+  // an attacker with only the e-mail cannot seize the account.
+  if (user.twoFactorEnabled) {
+    if (!b.twoFactorCode) throw new AppError(400, "رمز التحقق الثنائي مطلوب لإكمال إعادة التعيين");
+    if (!verifyTotp(user.twoFactorSecret, b.twoFactorCode))
+      throw new AppError(400, "رمز التحقق الثنائي غير صحيح");
+  }
+
+  if (verifyPassword(next, user.password)) throw badRequest("كلمة المرور الجديدة مطابقة للحالية");
+
+  user.password = hashPassword(next);
+  if (Array.isArray(user.trustedDevices)) user.trustedDevices = [];
+
+  // single use + revoke every existing session for this account
+  rec.usedAt = now();
+  pruneResets();
+  for (const h of userSessionHashes(user.id)) delete sessions[h];
+  saveResets();
+  saveSessions();
+  save();
+  audit(req, "password.reset.success", { actorId: user.id, username: user.username });
+  json(res, 200, { success: true });
+});
+
+route("POST", "/api/auth/logout-all", async (req, res) => {
+  const s = requireSession(req);
+  for (const h of userSessionHashes(s.user.id, s.hash)) delete sessions[h];
+  saveSessions();
+  audit(req, "logout-all");
+  json(res, 200, { success: true, keptCurrent: true });
 });
 
 /* ── TWO-FACTOR (TOTP) ── */
@@ -1813,6 +2065,161 @@ route("GET", "/api/dashboard", async (req, res, p, url) => {
   json(res, 200, buildDashboard(url.searchParams.get("clinicId") || s.user.clinicId));
 });
 
+/* ── SOFT DELETE + PAGINATION (shared) ──
+ * A row is "in the trash" when it carries a deletedAt stamp; absent/undefined
+ * counts as live, so old db.json files keep working untouched. Permanent removal
+ * only happens through the auto-purge sweep after LIMITS.trashTtlMs.
+ */
+
+const TRASH_TYPES = {
+  patients: { coll: "patients", label: "المريض", search: ["fullName", "fileNumber", "phone"] },
+  appointments: { coll: "appointments", label: "الموعد", search: ["title", "notes"] },
+  invoices: { coll: "invoices", label: "الفاتورة", search: ["id", "paymentMethod", "status"] },
+  records: { coll: "records", label: "السجل", search: ["chiefComplaint", "diagnosis", "treatment"] },
+  inventory: { coll: "inventory", label: "الصنف", search: ["itemName", "itemNameEn", "category", "supplier"] },
+  services: { coll: "services", label: "الخدمة", search: ["name"] },
+  tasks: { coll: "tasks", label: "المهمة", search: ["title"] },
+};
+
+const isLive = (x) => !!x && !x.deletedAt;
+
+function liveByClinic(coll, clinicId) {
+  return db[coll].filter((x) => x.clinicId === clinicId && isLive(x));
+}
+
+/** Stamps a live row as deleted (reversible). */
+function softDeleteRow(req, row) {
+  const s = requireSession(req);
+  row.deletedAt = now();
+  row.deletedBy = s.user.id;
+  row.deletedByName = s.user.fullName || s.user.username || "";
+  save();
+  return row;
+}
+
+/** Idempotent back-fill: every trashable row gets explicit deletedAt/deletedBy. */
+function migrateSoftDelete() {
+  let n = 0;
+  for (const { coll } of Object.values(TRASH_TYPES)) {
+    if (!Array.isArray(db[coll])) continue;
+    for (const row of db[coll]) {
+      if (row.deletedAt === undefined) { row.deletedAt = null; n++; }
+      if (row.deletedBy === undefined) row.deletedBy = null;
+    }
+  }
+  return n;
+}
+
+/** Permanently drops trash rows older than the TTL. Returns how many went. */
+function purgeExpiredTrash() {
+  const t = Date.now();
+  let removed = 0;
+  for (const { coll } of Object.values(TRASH_TYPES)) {
+    const before = db[coll].length;
+    db[coll] = db[coll].filter((row) => {
+      if (!row.deletedAt) return true;
+      return t - (Date.parse(row.deletedAt) || 0) < LIMITS.trashTtlMs;
+    });
+    removed += before - db[coll].length;
+  }
+  if (removed) save();
+  return removed;
+}
+
+const PAGING_DEFAULT_LIMIT = 50;
+const PAGING_MAX_LIMIT = 200;
+
+function wantsPaging(url) {
+  return url.searchParams.has("page") || url.searchParams.has("limit");
+}
+
+function searchFilter(list, term, fields) {
+  const q = String(term || "").trim().toLowerCase();
+  if (!q) return list;
+  return list.filter((x) => fields.some((f) => String(x[f] == null ? "" : x[f]).toLowerCase().includes(q)));
+}
+
+function sortList(list, sortParam) {
+  if (!sortParam) return list;
+  const dir = String(sortParam).startsWith("-") ? -1 : 1;
+  const key = String(sortParam).replace(/^-/, "");
+  return list.slice().sort((a, b) => {
+    const av = a[key]; const bv = b[key];
+    if (typeof av === "number" || typeof bv === "number")
+      return ((Number(av) || 0) - (Number(bv) || 0)) * dir;
+    return String(av == null ? "" : av).localeCompare(String(bv == null ? "" : bv)) * dir;
+  });
+}
+
+/**
+ * Backward compatible paging: returns {items,total,page,limit} ONLY when the
+ * caller sent ?page= or ?limit=. Otherwise returns null so the handler keeps its
+ * historical response shape (a bare array, or {patients,pages}, ...).
+ */
+function pagedResponse(url, list, searchFields) {
+  if (!wantsPaging(url)) return null;
+  let out = searchFields ? searchFilter(list, url.searchParams.get("q") || url.searchParams.get("search"), searchFields) : list.slice();
+  out = sortList(out, url.searchParams.get("sort"));
+  const page = Math.max(1, num(url.searchParams.get("page"), 1));
+  const limit = Math.min(PAGING_MAX_LIMIT, Math.max(1, num(url.searchParams.get("limit"), PAGING_DEFAULT_LIMIT)));
+  const total = out.length;
+  const start = (page - 1) * limit;
+  return { items: out.slice(start, start + limit), total, page, limit };
+}
+
+/* ── TRASH (view / restore) ── */
+
+route("GET", "/api/trash", async (req, res, p, url) => {
+  const s = requireSession(req);
+  const ids = new Set(ownedClinicIds(s.user));
+  const only = url.searchParams.get("type");
+  const out = [];
+  for (const [slug, def] of Object.entries(TRASH_TYPES)) {
+    if (only && only !== slug) continue;
+    for (const row of db[def.coll]) {
+      if (isLive(row)) continue;
+      if (!ids.has(row.clinicId)) continue;
+      out.push({
+        type: slug, id: row.id, clinicId: row.clinicId,
+        label: def.label, deletedAt: row.deletedAt || null,
+        deletedBy: row.deletedBy || null, deletedByName: row.deletedByName || "",
+        summary: row.fullName || row.title || row.name || row.id,
+      });
+    }
+  }
+  out.sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
+  json(res, 200, { items: out, total: out.length });
+});
+
+route("POST", "/api/trash/:type/:id/restore", async (req, res, p) => {
+  // owner/manager only — staff can delete but only the boss can resurrect
+  const s = requireClinicOwner(req);
+  const def = TRASH_TYPES[p.type];
+  if (!def) throw badRequest("نوع غير معروف");
+  const row = db[def.coll].find((x) => x.id === p.id && !isLive(x));
+  if (!row) throw notFound("غير موجود في المهملات");
+  if (!ownedClinicIds(s.user).includes(row.clinicId)) throw forbidden("هذه العيادة ليست لك");
+  row.deletedAt = null;
+  row.deletedBy = null;
+  row.deletedByName = "";
+  save();
+  audit(req, "trash.restore", { detail: `${p.type}:${p.id}` });
+  json(res, 200, { success: true, type: p.type, id: p.id });
+});
+
+route("DELETE", "/api/trash/:type/:id", async (req, res, p) => {
+  const s = requireClinicOwner(req);
+  const def = TRASH_TYPES[p.type];
+  if (!def) throw badRequest("نوع غير معروف");
+  const i = db[def.coll].findIndex((x) => x.id === p.id && !isLive(x));
+  if (i < 0) throw notFound("غير موجود في المهملات");
+  if (!ownedClinicIds(s.user).includes(db[def.coll][i].clinicId)) throw forbidden("هذه العيادة ليست لك");
+  db[def.coll].splice(i, 1);
+  save();
+  audit(req, "trash.purge", { detail: `${p.type}:${p.id}` });
+  json(res, 200, { success: true });
+});
+
 /* ── PATIENTS ── */
 
 route("GET", "/api/patients", async (req, res, p, url) => {
@@ -1822,7 +2229,7 @@ route("GET", "/api/patients", async (req, res, p, url) => {
   const search = (url.searchParams.get("search") || "").trim();
   const page = num(url.searchParams.get("page"), 1);
 
-  let list = db.patients.filter((x) => x.clinicId === clinicId);
+  let list = db.patients.filter((x) => x.clinicId === clinicId && isLive(x));
   if (search) {
     const q = search.toLowerCase();
     list = list.filter(
@@ -1832,6 +2239,9 @@ route("GET", "/api/patients", async (req, res, p, url) => {
     );
   }
   list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+
+  const paged = pagedResponse(url, list, TRASH_TYPES.patients.search);
+  if (paged) return json(res, 200, paged);
 
   const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
   const start = (Math.max(1, page) - 1) * PER_PAGE;
@@ -1894,13 +2304,16 @@ route("PUT", "/api/patients", async (req, res) => {
 route("DELETE", "/api/patients", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const i = db.patients.findIndex((x) => x.id === b.id);
-  if (i < 0) throw notFound("المريض غير موجود");
-  assertRecordClinic(s.user, db.patients[i], "المريض");
-  db.patients.splice(i, 1);
-  db.records = db.records.filter((r) => r.patientId !== b.id);
-  save();
-  json(res, 200, { success: true });
+  const patient = db.patients.find((x) => x.id === b.id && isLive(x));
+  if (!patient) throw notFound("المريض غير موجود");
+  assertRecordClinic(s.user, patient, "المريض");
+  // money still owed blocks a silent delete: caller must pass confirm:true
+  const unpaid = db.invoices.filter((i) => i.patientId === patient.id && isLive(i) && num(i.dueAmount) > 0);
+  if (unpaid.length && b.confirm !== true)
+    throw new AppError(409, `المريض عليه ${unpaid.length} فاتورة غير مسددة. أعد الطلب مع confirm:true للتأكيد.`);
+  softDeleteRow(req, patient);
+  audit(req, "patient.delete", { detail: patient.id });
+  json(res, 200, { success: true, softDeleted: true });
 });
 
 /* ── APPOINTMENTS ── */
@@ -1913,6 +2326,7 @@ route("DELETE", "/api/patients", async (req, res) => {
 function appointmentClashes(clinicId, doctorId, startMs, endMs, ignoreId) {
   return db.appointments.some((a) => {
     if (a.id === ignoreId) return false;
+    if (!isLive(a)) return false;
     if (a.clinicId !== clinicId) return false;
     if (String(a.status) === "cancelled" || String(a.status) === "canceled") return false;
     if (doctorId && a.doctorId !== doctorId) return false;
@@ -1927,12 +2341,14 @@ route("GET", "/api/appointments", async (req, res, p, url) => {
   requireSession(req);
   const clinicId = clinicScope(req, url);
   const date = url.searchParams.get("date");
-  let list = db.appointments.filter((a) => a.clinicId === clinicId);
+  let list = db.appointments.filter((a) => a.clinicId === clinicId && isLive(a));
   if (date) {
     const d = new Date(date);
     if (!Number.isNaN(d.getTime())) list = list.filter((a) => sameDay(a.startTime, d));
   }
   list.sort((a, b) => String(a.startTime).localeCompare(String(b.startTime)));
+  const paged = pagedResponse(url, list, TRASH_TYPES.appointments.search);
+  if (paged) return json(res, 200, { ...paged, items: paged.items.map(decorateAppointment) });
   json(res, 200, list.map(decorateAppointment));
 });
 
@@ -2005,12 +2421,12 @@ route("PUT", "/api/appointments", async (req, res) => {
 route("DELETE", "/api/appointments", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const i = db.appointments.findIndex((a) => a.id === b.id);
-  if (i < 0) throw notFound("الموعد غير موجود");
-  assertRecordClinic(s.user, db.appointments[i], "الموعد");
-  db.appointments.splice(i, 1);
-  save();
-  json(res, 200, { success: true });
+  const appt = db.appointments.find((a) => a.id === b.id && isLive(a));
+  if (!appt) throw notFound("الموعد غير موجود");
+  assertRecordClinic(s.user, appt, "الموعد");
+  softDeleteRow(req, appt);
+  audit(req, "appointment.delete", { detail: appt.id });
+  json(res, 200, { success: true, softDeleted: true });
 });
 
 /* ── INVOICES ── */
@@ -2019,9 +2435,11 @@ route("GET", "/api/invoices", async (req, res, p, url) => {
   requireSession(req);
   const clinicId = clinicScope(req, url);
   const status = url.searchParams.get("status");
-  let list = db.invoices.filter((i) => i.clinicId === clinicId);
+  let list = db.invoices.filter((i) => i.clinicId === clinicId && isLive(i));
   if (status) list = list.filter((i) => i.status === status);
   list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  const paged = pagedResponse(url, list, TRASH_TYPES.invoices.search);
+  if (paged) return json(res, 200, { ...paged, items: paged.items.map(decorateInvoice) });
   json(res, 200, { invoices: list.map(decorateInvoice) });
 });
 
@@ -2065,22 +2483,24 @@ route("PUT", "/api/invoices", async (req, res) => {
 route("DELETE", "/api/invoices", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const i = db.invoices.findIndex((x) => x.id === b.id);
-  if (i < 0) throw notFound("الفاتورة غير موجودة");
-  assertRecordClinic(s.user, db.invoices[i], "الفاتورة");
-  db.invoices.splice(i, 1);
-  save();
-  json(res, 200, { success: true });
+  const invoice = db.invoices.find((x) => x.id === b.id && isLive(x));
+  if (!invoice) throw notFound("الفاتورة غير موجودة");
+  assertRecordClinic(s.user, invoice, "الفاتورة");
+  softDeleteRow(req, invoice);
+  audit(req, "invoice.delete", { detail: invoice.id });
+  json(res, 200, { success: true, softDeleted: true });
 });
 
 /* ── USERS ── */
 
-route("GET", "/api/users", async (req, res) => {
+route("GET", "/api/users", async (req, res, p, url) => {
   const s = requireSession(req);
   const ids = new Set(ownedClinicIds(s.user));
   const list = isSiteOwner(s.user)
     ? db.users
     : db.users.filter((u) => ids.has(u.clinicId) || u.id === s.user.id);
+  const paged = pagedResponse(url, list, ["username", "fullName", "phone", "email", "role"]);
+  if (paged) return json(res, 200, { ...paged, items: paged.items.map(publicUser) });
   json(res, 200, list.map(publicUser));
 });
 
@@ -2234,21 +2654,24 @@ route("GET", "/api/records", async (req, res, p, url) => {
   const clinicId = clinicScope(req, url);
   const owned = new Set(ownedClinicIds(s.user));
 
+  const decorate = (r) => {
+    const d = userOf(r.doctorId);
+    return { ...r, doctor: d ? { id: d.id, fullName: d.fullName } : null };
+  };
   const list = db.records
     .filter((r) => {
+      if (!isLive(r)) return false;
       const pt = patientOf(r.patientId);
       // never cross the clinic boundary, even when a patientId is supplied
       if (!pt || (!isSiteOwner(s.user) && !owned.has(pt.clinicId))) return false;
       if (patientId) return r.patientId === patientId;
       return !clinicId || pt.clinicId === clinicId;
     })
-    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
-    .map((r) => {
-      const d = userOf(r.doctorId);
-      return { ...r, doctor: d ? { id: d.id, fullName: d.fullName } : null };
-    });
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
 
-  json(res, 200, list);
+  const paged = pagedResponse(url, list, TRASH_TYPES.records.search);
+  if (paged) return json(res, 200, { ...paged, items: paged.items.map(decorate) });
+  json(res, 200, list.map(decorate));
 });
 
 route("POST", "/api/records", async (req, res) => {
@@ -2280,15 +2703,13 @@ route("PUT", "/api/records", async (req, res) => {
 route("DELETE", "/api/records", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const i = db.records.findIndex((x) => x.id === b.id);
-  if (i < 0) throw notFound("السجل غير موجود");
-  ownedPatient(s.user, db.records[i].patientId);
-  db.records.splice(i, 1);
-  save();
-  json(res, 200, { success: true });
+  const r = db.records.find((x) => x.id === b.id && isLive(x));
+  if (!r) throw notFound("السجل غير موجود");
+  ownedPatient(s.user, r.patientId);
+  softDeleteRow(req, r);
+  audit(req, "record.delete", { detail: r.id });
+  json(res, 200, { success: true, softDeleted: true });
 });
-
-/* ── TASKS ── */
 
 /* ── TASKS ──
  * Clinic-wide: every member of staff sees the same list. The handlers below
@@ -2305,9 +2726,11 @@ route("GET", "/api/tasks", async (req, res, p, url) => {
   requireSession(req);
   const clinicId = clinicScope(req, url);
   const status = url.searchParams.get("status");
-  let list = db.tasks.filter((t) => t.clinicId === clinicId);
+  let list = db.tasks.filter((t) => t.clinicId === clinicId && isLive(t));
   if (status) list = list.filter((t) => t.status === status);
   list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  const paged = pagedResponse(url, list, TRASH_TYPES.tasks.search);
+  if (paged) return json(res, 200, paged);
   json(res, 200, list);
 });
 
@@ -2355,12 +2778,12 @@ route("PUT", "/api/tasks", async (req, res) => {
 route("DELETE", "/api/tasks", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const i = db.tasks.findIndex((t) => t.id === b.id);
-  if (i < 0) throw notFound("المهمة غير موجودة");
-  if (!clinicOfTask(s.user, db.tasks[i])) throw forbidden("هذه المهمة تخص عيادة أخرى");
-  db.tasks.splice(i, 1);
-  save();
-  json(res, 200, { success: true });
+  const task = db.tasks.find((t) => t.id === b.id && isLive(t));
+  if (!task) throw notFound("المهمة غير موجودة");
+  if (!clinicOfTask(s.user, task)) throw forbidden("هذه المهمة تخص عيادة أخرى");
+  softDeleteRow(req, task);
+  audit(req, "task.delete", { detail: task.id });
+  json(res, 200, { success: true, softDeleted: true });
 });
 
 /* ── SERVICES (the bookable menu: name + price + duration) ── */
@@ -2391,9 +2814,12 @@ function serviceDuration(service) {
 route("GET", "/api/services", async (req, res, p, url) => {
   const s = requireSession(req);
   const ids = new Set(ownedClinicIds(s.user));
-  let list = db.services.filter((x) => ids.has(x.clinicId));
+  let list = db.services.filter((x) => ids.has(x.clinicId) && isLive(x));
   if (url.searchParams.get("all") !== "true") list = list.filter((x) => x.isActive !== false);
-  json(res, 200, list.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0)));
+  list.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
+  const paged = pagedResponse(url, list, TRASH_TYPES.services.search);
+  if (paged) return json(res, 200, paged);
+  json(res, 200, list);
 });
 
 route("POST", "/api/services", async (req, res) => {
@@ -2434,19 +2860,23 @@ route("PUT", "/api/services", async (req, res) => {
 route("DELETE", "/api/services", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const i = db.services.findIndex((x) => x.id === b.id);
-  if (i < 0) throw notFound("الخدمة غير موجودة");
-  serviceClinicId(s.user, db.services[i].clinicId);
-  db.services.splice(i, 1);
-  save();
-  json(res, 200, { success: true });
+  const service = db.services.find((x) => x.id === b.id && isLive(x));
+  if (!service) throw notFound("الخدمة غير موجودة");
+  serviceClinicId(s.user, service.clinicId);
+  softDeleteRow(req, service);
+  audit(req, "service.delete", { detail: service.id });
+  json(res, 200, { success: true, softDeleted: true });
 });
 
 /* ── INVENTORY ── */
 
 route("GET", "/api/inventory", async (req, res, p, url) => {
   requireSession(req);
-  json(res, 200, db.inventory.filter((i) => i.clinicId === clinicScope(req, url)));
+  let list = db.inventory.filter((i) => i.clinicId === clinicScope(req, url) && isLive(i));
+  list.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+  const paged = pagedResponse(url, list, TRASH_TYPES.inventory.search);
+  if (paged) return json(res, 200, paged);
+  json(res, 200, list);
 });
 
 const INV_NUMERIC = new Set(["quantity", "maxStock", "minStock", "unitPrice", "cost"]);
@@ -2482,12 +2912,12 @@ route("PUT", "/api/inventory", async (req, res) => {
 route("DELETE", "/api/inventory", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const i = db.inventory.findIndex((x) => x.id === b.id);
-  if (i < 0) throw notFound("الصنف غير موجود");
-  assertRecordClinic(s.user, db.inventory[i], "الصنف");
-  db.inventory.splice(i, 1);
-  save();
-  json(res, 200, { success: true });
+  const item = db.inventory.find((x) => x.id === b.id && isLive(x));
+  if (!item) throw notFound("الصنف غير موجود");
+  assertRecordClinic(s.user, item, "الصنف");
+  softDeleteRow(req, item);
+  audit(req, "inventory.delete", { detail: item.id });
+  json(res, 200, { success: true, softDeleted: true });
 });
 
 /* ── CHAT ──
@@ -2542,6 +2972,8 @@ route("GET", "/api/chat", async (req, res, p, url) => {
         };
       })
       .sort((a, b) => String(b.lastMessageAt || "").localeCompare(String(a.lastMessageAt || "")));
+    const paged = pagedResponse(url, conversations, ["partnerId"]);
+    if (paged) return json(res, 200, { ...paged, conversations: paged.items, allUsers });
     return json(res, 200, { conversations, allUsers });
   }
 
@@ -2564,6 +2996,8 @@ route("GET", "/api/chat", async (req, res, p, url) => {
         const sender = userOf(m.senderId);
         return { ...m, sender: sender ? { id: sender.id, fullName: sender.fullName, role: sender.role } : null };
       });
+    const paged = pagedResponse(url, messages, ["message"]);
+    if (paged) return json(res, 200, paged);
     return json(res, 200, { messages });
   }
 
@@ -2839,7 +3273,7 @@ const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0
 /** The clinic's active bookable menu, ordered for display. */
 function clinicServices(clinic, activeOnly = true) {
   return db.services
-    .filter((x) => x.clinicId === clinic.id && (!activeOnly || x.isActive !== false))
+    .filter((x) => x.clinicId === clinic.id && isLive(x) && (!activeOnly || x.isActive !== false))
     .sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
 }
 
@@ -2873,7 +3307,7 @@ function bookingSlots(clinic, dateStr, doctorId, durationMin) {
   // busy = [startMs, endMs) of everything already booked that day, whichever
   // door it came through (the app, or this page) — a booked hour is a booked hour
   const busy = db.appointments
-    .filter((a) => a.clinicId === clinic.id && !["cancelled", "canceled"].includes(String(a.status)))
+    .filter((a) => a.clinicId === clinic.id && isLive(a) && !["cancelled", "canceled"].includes(String(a.status)))
     .filter((a) => (doctorId ? a.doctorId === doctorId : true))
     .filter((a) => sameDay(a.startTime, day))
     .map((a) => {
@@ -2999,9 +3433,10 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
   const phoneDigits = (v) => String(v).replace(/\D/g, "");
   const samePhoneDay = db.appointments.some((a) => {
     if (a.clinicId !== clinic.id) return false;
+    if (!isLive(a)) return false;
     if (a.status === "cancelled" || a.status === "canceled") return false;
     if (!a.startTime || ymd(new Date(a.startTime)) !== date) return false;
-    const owner = db.patients.find((p2) => p2.id === a.patientId);
+    const owner = db.patients.find((p2) => p2.id === a.patientId && isLive(p2));
     return !!owner && phoneDigits(owner.phone) === phoneDigits(phone);
   });
   if (samePhoneDay)
@@ -3023,7 +3458,7 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
     throw new AppError(409, "عذراً، انتهت المواعيد المتاحة في هذا اليوم — جرّب يوماً آخر");
 
   // reuse an existing patient with the same phone, otherwise create one
-  let patient = db.patients.find((p2) => p2.clinicId === clinic.id && p2.phone === phone);
+  let patient = db.patients.find((p2) => p2.clinicId === clinic.id && p2.phone === phone && isLive(p2));
   if (!patient) {
     patient = {
       id: uid("pat"), clinicId: clinic.id, fullName: name, gender: b.gender || "",
@@ -3279,16 +3714,28 @@ function securityHeaders(req, res) {
   }
 }
 
+/**
+ * An Origin is "ours" only when it exactly equals the configured ORIGIN, or —
+ * when no ORIGIN is configured — when its host matches the Host we were reached
+ * on (i.e. same-origin). Anything else is refused, including on OPTIONS.
+ */
+function originAllowed(req, origin) {
+  if (!origin || !req) return false;
+  if (ALLOWED_ORIGIN) return origin === ALLOWED_ORIGIN;
+  try { return new URL(origin).host === req.headers.host; } catch { return false; }
+}
+
 function cors(req, res) {
   const origin = req.headers.origin;
-  if (origin && (!ALLOWED_ORIGIN || origin === ALLOWED_ORIGIN)) {
-    res.setHeader("Access-Control-Allow-Origin", origin); // reflect, never "*" with credentials
-    res.setHeader("Vary", "Origin");
-  } else if (!origin) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  } else {
-    res.setHeader("Vary", "Origin"); // non-matching origin: never reflected
+  // Reflect ONLY an origin we trust. A foreign Origin gets no ACAO at all, so
+  // the browser blocks the response — for simple requests and preflights alike.
+  if (origin && originAllowed(req, origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
   }
+  // Vary on Origin whenever the caller sent one (a shared cache must not reuse a
+  // response minted for another origin). A missing Origin (curl, same-origin GET,
+  // navigations) needs no ACAO: CORS does not apply to it.
+  if (origin) res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,PATCH,OPTIONS");
@@ -3539,6 +3986,10 @@ const sweeper = setInterval(() => {
       saveSessions();
       log(`swept ${removed} expired session(s)`);
     }
+    const purged = purgeExpiredTrash();
+    if (purged) log(`purged ${purged} trashed row(s) past the ${Math.round(LIMITS.trashTtlMs / 86400000)}-day window`);
+    const staleResets = pruneResets();
+    if (staleResets) saveResets();
     pruneRateBuckets();
   } catch (e) {
     fail("session sweeper error:", e.message); // never let the interval die
@@ -3552,7 +4003,7 @@ if (backupTimer.unref) backupTimer.unref();
 function banner(actualPort) {
   const mem = Math.round(process.memoryUsage().rss / 1048576);
   const creds = IS_PROD
-    ? "     الإنتاج     تم تعطيل كلمات المرور التجريبية (راجع السجل)"
+    ? "     الإنتاج     لا حسابات تجريبية — أنشئ المالك عبر OWNER_* أو --create-owner"
     : `     حسابات تجريبية:
        admin      / admin123       مدير عام
        doctor     / doctor123      طبيب
@@ -3584,13 +4035,60 @@ function startupChecks() {
     warn("NODE_ENV=production without ORIGIN set: CORS will only accept same-host origins.");
   if (IS_PROD && HOST !== "127.0.0.1" && HOST !== "localhost" && !TRUST_PROXY)
     warn("listening on a public interface without TRUST_PROXY=1: client IP throttling may see the proxy IP.");
-  if (!ENCRYPTION_KEY)
+  if (!ENCRYPTION_KEY) {
+    if (IS_PROD) {
+      fail("ENCRYPTION_KEY is required when NODE_ENV=production (it seals the TOTP");
+      fail("seeds and the medical fields at rest). Set a long random value and restart.");
+      process.exit(1);
+    }
     warn("ENCRYPTION_KEY is unset: medical fields (blood type, allergies, record notes) are stored in clear.");
+  }
+}
+
+/**
+ * `node server.js --create-owner` — create (or reset) the first site owner from
+ * OWNER_USERNAME / OWNER_PASSWORD (or --owner-username / --owner-password),
+ * persist, and exit. The password is never printed.
+ */
+function createOwnerCli() {
+  const username = String(process.env.OWNER_USERNAME || argOf("owner-username") || "").trim();
+  const password = process.env.OWNER_PASSWORD || argOf("owner-password") || "";
+  if (!username || !password) {
+    fail("usage: OWNER_USERNAME=<name> OWNER_PASSWORD=<12+ chars> node server.js --create-owner");
+    process.exit(2);
+  }
+  try { checkPasswordPolicy(password); }
+  catch (e) { fail("owner password rejected:", e.message); process.exit(2); }
+
+  const existing = db.users.find((u) => String(u.username).toLowerCase() === username.toLowerCase());
+  if (existing) {
+    existing.password = hashPassword(password);
+    existing.role = "super_admin";
+    log(`owner password set for ${username} (not logged)`);
+  } else {
+    db.users.push({
+      id: uid("user"), username, password: hashPassword(password),
+      fullName: String(process.env.OWNER_NAME || "مالك الموقع").trim() || "مالك الموقع",
+      phone: String(process.env.OWNER_PHONE || "").trim(),
+      email: String(process.env.OWNER_EMAIL || "").trim(),
+      role: "super_admin", clinicId: null, permissions: {},
+      twoFactorEnabled: false, trustedDevices: [], createdAt: now(),
+    });
+    log(`owner account created: ${username} (not logged)`);
+  }
+  audit(null, "owner.create", { username });
+  hardenPerms();
 }
 
 processAliveHooks();
 startupChecks();
 load();
-runBackup("boot");
-listen(PORT, HOST);
-server.on("listening", () => banner(server.address().port));
+if (CREATE_OWNER) {
+  createOwnerCli();
+  flush().then(() => process.exit(0)).catch(() => process.exit(1));
+} else {
+  hardenPerms();
+  runBackup("boot");
+  listen(PORT, HOST);
+  server.on("listening", () => banner(server.address().port));
+}

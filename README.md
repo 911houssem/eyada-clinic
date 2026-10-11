@@ -90,8 +90,9 @@ node server.js
 | طبيب | `doctor` | `doctor123` |
 | استقبال | `reception` | `reception123` |
 
-> في الإنتاج (`NODE_ENV=production`) تُعطَّل كلمات المرور الثابتة وتُولَّد كلمات
-> عشوائية تُطبع مرة واحدة في السجل (أو تُضبط عبر `SEED_PASSWORD`).
+> في الإنتاج (`NODE_ENV=production`) لا تُبذر أي بيانات تجريبية ولا حسابات demo.
+> أنشئ أول مالك عبر `OWNER_USERNAME` + `OWNER_PASSWORD` (12+ حرفاً) أو
+> `node server.js --create-owner`. لا تُطبع أي كلمة مرور في السجل.
 
 ## 🔒 الإنتاج والأمان
 
@@ -104,17 +105,35 @@ node server.js
 
 | المتغيّر | الوصف |
 |---|---|
-| `NODE_ENV=production` | تشغيل تشديدات الإنتاج (كوكي `Secure`، تعطيل حساب التجربة) |
+| `NODE_ENV=production` | تشديدات الإنتاج: يرفض الإقلاع بدون `ENCRYPTION_KEY`، لا بذر تجريبي، صلاحيات 700/600 |
 | `DATA_DIR` | مجلد البيانات — **ضعه خارج مجلد النشر** في الإنتاج |
-| `ORIGIN` | الأصل المسموح به لـ CORS |
+| `ORIGIN` | الأصل المسموح به لـ CORS (بدونه: نفس المضيف فقط) |
+| `OWNER_USERNAME` + `OWNER_PASSWORD` | أول مالك في الإنتاج (12+ حرفاً) أو استخدم `--create-owner` |
 | `TRUST_PROXY=1` | خلف وكيل عكسي (لضبط IP الحقيقي و`X-Forwarded-Proto`) |
-| `ENCRYPTION_KEY` | تفعيل تشفير الحقول الطبية على القرص (AES-256-GCM) |
+| `ENCRYPTION_KEY` | **إلزامي في الإنتاج**: تشفير الحقول الطبية وسرّ TOTP على القرص (AES-256-GCM) |
 | `PORT` / `HOST` | منفذ وواجهة الاستماع |
+
+## 🔁 نقاط API (المرحلة 2)
+
+| النقطة | الوصف |
+|---|---|
+| `POST /api/auth/forgot` | طلب رابط إعادة التعيين (ردّ موحّد دائماً؛ يُرسل عبر `notifiers/`) |
+| `POST /api/auth/reset` | { token, newPassword, twoFactorCode? } — يبطل كل الجلسات والأجهزة |
+| `POST /api/auth/logout-all` | إنهاء كل الجلسات عدا الحالية |
+| `GET /api/trash` | العناصر المحذوفة ناعماً (حسب العيادات المسموح بها) |
+| `POST /api/trash/:type/:id/restore` | استعادة (صاحب العيادة/المالك) |
+| `DELETE /api/trash/:type/:id` | حذف نهائي فوري |
+| `GET <list>?page=&limit=&q=&sort=` | ترقيم اختياري يرجع `{items,total,page,limit}` |
+
+- `:type` ∈ `patients | appointments | invoices | records | inventory | services | tasks`.
+- **توافق خلفي**: بلا `page`/`limit` يبقى الشكل القديم كما هو، فيعمل الـ UI الحالي
+  دون تغيير. لتحديث الواجهة ليستفيد من الترقيم/المهملات يلزم تعديل الحزمة المبنية
+  `_next/` (بلا مصدر) — انظر قائمة «تحديثات الواجهة المطلوبة» في تقرير المرحلة.
 
 ## ✅ الاختبارات
 
 ```
-npm test          # المجموعات المستقرة (بلا متصفّح)
+npm test          # المجموعات المستقرة (بلا متصفّح) + test-security + test-phase2
 npm run test:all  # كل المجموعات، بما فيها واجهات المتصفّح (تتطلّب Chrome)
 ```
 
@@ -130,6 +149,7 @@ npm run test:all  # كل المجموعات، بما فيها واجهات ال�
 ```
 server.js            الخادم + واجهات API + تقديم الملفات الثابتة
 booking-page.js      مُنشئ صفحة الحجز العامة المستقلة
+notifiers/           تجريد الإرسال (console الآن، واتساب/ويب هوك/بريد لاحقاً)
 index.html           هيكل عميل لوحة التحكم
 _next/               ملفات الواجهة المبنية (JS/CSS/الخطوط)
 tests/               مجموعات الاختبار + مشغّل run-suite + أداة CDP
