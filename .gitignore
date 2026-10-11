@@ -6,20 +6,31 @@ ui-out.txt
 ui-err.txt
 
 # artifacts written by the suites
-tools/booking-dom*.html
-tools/*-out.txt
-tools/*-err.txt
+tests/booking-dom*.html
+tests/*-out.txt
+tests/*-err.txt
 
-# live database (holds account credentials + session tokens; the server seeds
-# demo data automatically on first run, so it is never committed)
+# live database (holds account credentials; the server seeds demo data
+# automatically on first run, so it is never committed)
 data/db.json
+
+# live session store (only SHA-256 hashes of tokens; per-host, never committed)
+data/sessions.json
+data/sessions.json.tmp
+
+# audit trail, runtime backups and the rotated server log
+data/audit.log
+data/audit.log.1
+data/backups/
+data/server.log
+data/server.log.1
 
 # database snapshots taken by the flush/repair helpers
 data/*.tmp
 data/*.backup-*
 data/*.pre-purge-*
 
-# superseded bundle copies (the live one + .pre-ui8 baseline are kept)
+# superseded bundle copies
 _next/static/chunks/*.orig
 _next/static/chunks/*.orig2
 

@@ -22,9 +22,20 @@ const crypto = require("crypto");
 /* ══════════════════════════ 1. CONFIG ══════════════════════════ */
 
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, "data");
+const IS_PROD = process.env.NODE_ENV === "production";
+const TRUST_PROXY = process.env.TRUST_PROXY === "1";
+
+/**
+ * Where the live database + logs live. Overridable so a production deploy can
+ * keep the data OUTSIDE the web root (defence in depth: even if the static
+ * gate below ever regressed, the data folder would not be under ROOT).
+ */
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const TMP_FILE = path.join(DATA_DIR, "db.json.tmp");
+const SESSIONS_FILE = path.join(DATA_DIR, "sessions.json");
+const AUDIT_FILE = path.join(DATA_DIR, "audit.log");
+const BACKUP_DIR = path.join(DATA_DIR, "backups");
 
 const argv = process.argv.slice(2);
 const argOf = (name) => {
@@ -43,8 +54,11 @@ const LIMITS = {
   headersTimeout: 20_000,
   requestTimeout: 60_000,
   keepAliveTimeout: 5_000,
-  sessionTtlMs: 30 * 24 * 60 * 60 * 1000, // 30 days
+  sessionTtlMs: 7 * 24 * 60 * 60 * 1000, // absolute lifetime (7 days)
+  sessionIdleMs: 12 * 60 * 60 * 1000, // idle timeout (12 hours)
   sessionSweepMs: 10 * 60 * 1000, // sweep every 10 minutes
+  backupIntervalMs: 6 * 60 * 60 * 1000, // auto-backup every 6 hours
+  backupKeep: 14, // rotate: keep the newest N snapshots
 };
 
 /* ══════════════════════════ 2. LOGGING ══════════════════════════ */
@@ -71,6 +85,118 @@ function toFile(line) {
   } catch {
     /* logging must never take the server down */
   }
+}
+
+/* ── Audit trail (data/audit.log) ──
+ * Append-only JSON-lines record of security-relevant actions: sign-in and
+ * sign-out, 2FA + password changes, impersonation, and every create/update/
+ * delete of clinics, users, patients, appointments, invoices, records and
+ * inventory. One line per event, size-capped so it can't grow forever.
+ */
+const AUDIT_MAX_BYTES = 5 * 1024 * 1024;
+
+/** Strip anything that looks like a secret before it reaches a log line. */
+function redact(v) {
+  return String(v == null ? "" : v)
+    .replace(/(token|password|passwd|secret|authorization|code)=[^\s,;&"']+/gi, "$1=***");
+}
+
+function audit(req, action, meta = {}) {
+  try {
+    const s = req ? currentSession(req) : null;
+    const entry = {
+      ts: new Date().toISOString(),
+      action,
+      actorId: meta.actorId || (s && s.user.id) || null,
+      username: redact(meta.username || (s && s.user.username) || ""),
+      role: (s && s.user.role) || null,
+      ip: req ? clientIp(req) : null,
+      method: req ? req.method : null,
+      path: req ? redact(String(req.url || "").split("?")[0]) : null,
+    };
+    if (meta.detail) entry.detail = redact(meta.detail);
+    if (meta.status) entry.status = meta.status;
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (fs.existsSync(AUDIT_FILE) && fs.statSync(AUDIT_FILE).size > AUDIT_MAX_BYTES)
+      fs.renameSync(AUDIT_FILE, AUDIT_FILE + ".1");
+    fs.appendFileSync(AUDIT_FILE, JSON.stringify(entry) + "\n");
+  } catch {
+    /* auditing must never break a request */
+  }
+}
+
+/* ── Automatic backups (data/backups) ──
+ * A plain copy of the (already atomic) db.json, rotated to keep the newest
+ * LIMITS.backupKeep snapshots. Runs on boot and every backupIntervalMs.
+ */
+function runBackup(reason = "scheduled") {
+  try {
+    if (!fs.existsSync(DB_FILE)) return null;
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    const name = `db-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    const dest = path.join(BACKUP_DIR, name);
+    fs.copyFileSync(DB_FILE, dest);
+    const files = fs
+      .readdirSync(BACKUP_DIR)
+      .filter((f) => f.startsWith("db-") && f.endsWith(".json"))
+      .sort();
+    while (files.length > LIMITS.backupKeep) {
+      try { fs.unlinkSync(path.join(BACKUP_DIR, files.shift())); } catch { /* keep rotating */ }
+    }
+    log(`backup written (${reason}) → ${path.join(path.basename(BACKUP_DIR), name)}`);
+    return dest;
+  } catch (e) {
+    warn("backup failed:", e.message);
+    return null;
+  }
+}
+
+/* ── Optional encryption at rest (AES-256-GCM) ──
+ * Off by default (ENCRYPTION_KEY unset → identity, so existing deploys and the
+ * test suite are unaffected). When ENCRYPTION_KEY is set, the medical fields
+ * below are sealed the moment the database is written to disk and opened again
+ * on load, so db.json / the rotated backups never contain that data in clear.
+ * The in-memory dataset and the API responses stay plaintext (delivered over
+ * TLS); only the file on disk is encrypted.
+ */
+const ENC_PREFIX = "enc:v1:";
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
+const encKey = ENCRYPTION_KEY
+  ? crypto.createHash("sha256").update(String(ENCRYPTION_KEY)).digest()
+  : null;
+const SENSITIVE_FIELDS = {
+  patients: ["bloodType", "allergies"],
+  records: ["chiefComplaint", "diagnosis", "treatment", "notes"],
+};
+
+function sealValue(v) {
+  if (!encKey || typeof v !== "string" || !v || v.startsWith(ENC_PREFIX)) return v;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", encKey, iv);
+  const ct = Buffer.concat([cipher.update(v, "utf8"), cipher.final()]);
+  return ENC_PREFIX + [iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), ct.toString("base64url")].join(":");
+}
+
+function openValue(v) {
+  if (typeof v !== "string" || !v.startsWith(ENC_PREFIX)) return v;
+  if (!encKey) return v; // key missing: keep the ciphertext rather than lose data
+  const [, , ivb, tagb, ctb] = v.split(":");
+  try {
+    const d = crypto.createDecipheriv("aes-256-gcm", encKey, Buffer.from(ivb, "base64url"));
+    d.setAuthTag(Buffer.from(tagb, "base64url"));
+    return Buffer.concat([d.update(Buffer.from(ctb, "base64url")), d.final()]).toString("utf8");
+  } catch {
+    return v; // wrong key / tampered value: never throw on read
+  }
+}
+
+function mapSensitive(obj, fn) {
+  for (const [coll, fields] of Object.entries(SENSITIVE_FIELDS)) {
+    const rows = obj && obj[coll];
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows) for (const f of fields) if (typeof row[f] === "string" && row[f]) row[f] = fn(row[f]);
+  }
+  return obj;
 }
 
 /* ══════════════════════════ 3. ERRORS ══════════════════════════ */
@@ -309,7 +435,7 @@ const json = (res, status, payload) => respond(res, status, payload);
 const EMPTY = {
   users: [], clinics: [], patients: [], appointments: [], invoices: [],
   tasks: [], records: [], inventory: [], messages: [], services: [],
-  plans: [], clinicSubscriptions: [], offers: [], sessions: {},
+  plans: [], clinicSubscriptions: [], offers: [], auditLog: [],
 };
 
 /**
@@ -434,7 +560,7 @@ function seed() {
     ...EMPTY, users, clinics, patients, appointments, invoices, offers, plans,
     tasks: [{
       id: uid("task"), clinicId, title: "طلب مخزون التخدير",
-      description: "تنبيه للمورد باقتراب نفاد المخزون", assignedTo: ownerId,
+      description: "تنبيه للمورد باقتراب نفاد المخزون", assignedTo: users[0].id,
       priority: "high", status: "todo",
       dueDate: new Date(Date.now() + 2 * 864e5).toISOString(), createdAt: nowIso,
     }],
@@ -453,7 +579,6 @@ function seed() {
       endDate: new Date(Date.now() + 365 * 864e5).toISOString(), trialEndDate: null,
       billingCycle: "monthly", notes: "",
     }],
-    sessions: {},
   };
 }
 
@@ -461,26 +586,9 @@ function seed() {
 function normalize(raw) {
   const db = { ...EMPTY, ...(raw && typeof raw === "object" ? raw : {}) };
   for (const k of Object.keys(EMPTY)) {
-    if (k === "sessions") {
-      if (!db.sessions || typeof db.sessions !== "object" || Array.isArray(db.sessions)) db.sessions = {};
-    } else if (!Array.isArray(db[k])) {
-      db[k] = [];
-    }
+    if (!Array.isArray(db[k])) db[k] = [];
   }
   return db;
-}
-
-function pruneSessions(db) {
-  const cutoff = Date.now() - LIMITS.sessionTtlMs;
-  let removed = 0;
-  for (const [token, s] of Object.entries(db.sessions)) {
-    if (!s || typeof s.userId !== "string" ||
-        (Date.parse(s.lastSeen || s.createdAt || 0) || 0) < cutoff) {
-      delete db.sessions[token];
-      removed++;
-    }
-  }
-  return removed;
 }
 
 let db;
@@ -606,15 +714,33 @@ const SAFE_SLUG = /^[a-z0-9][a-z0-9-]*$/;
 }
 
 function load() {
+  loadSessions();
   try {
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, "utf8");
-      db = normalize(JSON.parse(raw));
+      const parsed = JSON.parse(raw);
+      mapSensitive(parsed, openValue); // decrypt medical fields if ENCRYPTION_KEY is set
+      db = normalize(parsed);
       const notes = migrate();
-      const n = pruneSessions(db);
-      if (n) log(`pruned ${n} expired session(s) on boot`);
+      // Move any legacy raw-token sessions out of db.json and into the hashed
+      // session store so upgrades don't log everyone out (and old tokens can
+      // no longer be replayed straight from a leaked db.json).
+      if (db.sessions && typeof db.sessions === "object" && !Array.isArray(db.sessions)) {
+        let moved = 0;
+        for (const [token, s] of Object.entries(db.sessions)) {
+          if (s && typeof s.userId === "string") {
+            const h = sha256(token);
+            if (!sessions[h]) { sessions[h] = s; moved++; }
+          }
+        }
+        delete db.sessions;
+        if (moved) { log(`migrated ${moved} legacy session(s) into the hashed session store`); saveSessions(); }
+        save(true);
+      }
+      const n = pruneSessions();
+      if (n) { log(`pruned ${n} expired session(s) on boot`); saveSessions(); }
       if (notes.length) { for (const line of notes) log(`migrated: ${line}`); save(true); }
-      log(`database loaded — ${db.users.length} users, ${db.patients.length} patients, ${Object.keys(db.sessions).length} sessions`);
+      log(`database loaded — ${db.users.length} users, ${db.patients.length} patients, ${Object.keys(sessions).length} sessions`);
       return;
     }
   } catch (e) {
@@ -623,6 +749,17 @@ function load() {
   }
   db = normalize(seed());
   migrate();
+  if (IS_PROD) {
+    // Never ship the well-known demo passwords (admin/admin123 ...) in production:
+    // mint strong random ones (or use SEED_PASSWORD) and log them once.
+    const forced = process.env.SEED_PASSWORD;
+    for (const u of db.users) {
+      const pw = forced || crypto.randomBytes(12).toString("base64url");
+      u.password = hashPassword(pw);
+      log(`generated seed credentials — ${u.username} / ${pw}`);
+    }
+    warn("seeded demo data in production: change or delete the demo accounts before going live");
+  }
   save(true);
   log("database seeded with demo data");
 }
@@ -647,7 +784,8 @@ async function flush() {
   try {
     await fsp.mkdir(DATA_DIR, { recursive: true });
     handle = await fsp.open(TMP_FILE, "w");
-    await handle.writeFile(JSON.stringify(db, null, 2), "utf8");
+    const out = encKey ? mapSensitive(structuredClone(db), sealValue) : db;
+    await handle.writeFile(JSON.stringify(out, null, 2), "utf8");
     await handle.sync(); // flush to disk before the rename, so a power cut can't leave a renamed-but-empty file
     await handle.close();
     handle = null;
@@ -661,26 +799,89 @@ async function flush() {
   }
 }
 
-/* ══════════════════════════ 6. SESSIONS ══════════════════════════ */
+/* ══════════════════════════ 6. SESSIONS ══════════════════════════
+ * Sessions live in their own file (data/sessions.json), NOT mixed into the
+ * clinic dataset, and only a SHA-256 HASH of each token is stored: a leaked
+ * sessions.json cannot be replayed as a cookie. The raw token exists only in
+ * the client's HttpOnly cookie.
+ */
 
 const SESSION_COOKIE = "eyada_session";
+const DEVICE_COOKIE = "eyada_device";
+const TRUSTED_DEVICE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
-function cookieHeader(token) {
-  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`;
+const sha256 = (v) => crypto.createHash("sha256").update(String(v)).digest("hex");
+
+/** True when the request arrived over TLS (or we are told to assume so). */
+function isSecureRequest(req) {
+  if (req && req.socket && req.socket.encrypted) return true;
+  if (IS_PROD) return true;
+  if (TRUST_PROXY && req) {
+    const proto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+    if (proto === "https") return true;
+  }
+  return false;
 }
 
-function createSession(res, userId, impersonatorId = null) {
+function cookieAttrs(req, maxAge) {
+  return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${isSecureRequest(req) ? "; Secure" : ""}`;
+}
+
+let sessions = {};
+
+function loadSessions() {
+  if (!fs.existsSync(SESSIONS_FILE)) return;
+  try { sessions = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8")) || {}; }
+  catch { sessions = {}; }
+}
+
+let sessionsTimer = null;
+function saveSessions() {
+  clearTimeout(sessionsTimer);
+  sessionsTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      const tmp = SESSIONS_FILE + ".tmp";
+      fs.writeFileSync(tmp, JSON.stringify(sessions), "utf8");
+      fs.renameSync(tmp, SESSIONS_FILE);
+    } catch (e) { fail("could not persist sessions:", e.message); }
+  }, 80);
+  if (sessionsTimer.unref) sessionsTimer.unref();
+}
+
+/** Drops sessions past their absolute age or idle timeout. */
+function pruneSessions() {
+  const t = Date.now();
+  let removed = 0;
+  for (const [hash, s] of Object.entries(sessions)) {
+    if (!s || typeof s.userId !== "string"
+      || t - (Date.parse(s.createdAt) || 0) > LIMITS.sessionTtlMs
+      || t - (Date.parse(s.lastSeen || s.createdAt) || 0) > LIMITS.sessionIdleMs) {
+      delete sessions[hash];
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/** Every session row of a user (excluding one optional hash). */
+function userSessionHashes(userId, keepHash = null) {
+  return Object.keys(sessions).filter((h) => sessions[h].userId === userId && h !== keepHash);
+}
+
+function createSession(req, res, userId, impersonatorId = null) {
   const token = crypto.randomBytes(32).toString("hex");
-  db.sessions[token] = { userId, impersonatorId, createdAt: now(), lastSeen: now() };
-  save();
-  const cookies = [cookieHeader(token)];
+  sessions[sha256(token)] = { userId, impersonatorId, createdAt: now(), lastSeen: now() };
+  saveSessions();
+  const cookies = [`${SESSION_COOKIE}=${token}; ${cookieAttrs(req, LIMITS.sessionTtlMs / 1000)}`];
   if (impersonatorId) {
     const owner = db.users.find((u) => u.id === impersonatorId);
     cookies.push(
-      `impersonator_name=${encodeURIComponent(owner ? owner.fullName : "المالك")}; Path=/; SameSite=Lax; Max-Age=86400`
+      `impersonator_name=${encodeURIComponent(owner ? owner.fullName : "المالك")}; Path=/; SameSite=Lax` +
+      `; Max-Age=86400${isSecureRequest(req) ? "; Secure" : ""}`
     );
   } else {
-    cookies.push("impersonator_name=; Path=/; SameSite=Lax; Max-Age=0");
+    cookies.push(`impersonator_name=; Path=/; SameSite=Lax; Max-Age=0${isSecureRequest(req) ? "; Secure" : ""}`);
   }
   appendCookies(res, cookies);
   return token;
@@ -695,25 +896,35 @@ function appendCookies(res, cookies) {
 
 function clearSession(req, res) {
   const token = parseCookies(req)[SESSION_COOKIE];
-  if (token && db.sessions[token]) {
-    delete db.sessions[token];
-    save();
+  const hash = token ? sha256(token) : null;
+  if (hash && sessions[hash]) {
+    delete sessions[hash];
+    saveSessions();
   }
+  const secure = isSecureRequest(req) ? "; Secure" : "";
   appendCookies(res, [
-    `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
-    "impersonator_name=; Path=/; SameSite=Lax; Max-Age=0",
+    `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`,
+    `impersonator_name=; Path=/; SameSite=Lax; Max-Age=0${secure}`,
   ]);
 }
 
 function currentSession(req) {
   const token = parseCookies(req)[SESSION_COOKIE];
   if (!token) return null;
-  const s = db.sessions[token];
+  const hash = sha256(token);
+  const s = sessions[hash];
   if (!s) return null;
+  const t = Date.now();
+  if (t - (Date.parse(s.createdAt) || 0) > LIMITS.sessionTtlMs
+    || t - (Date.parse(s.lastSeen || s.createdAt) || 0) > LIMITS.sessionIdleMs) {
+    delete sessions[hash];
+    saveSessions();
+    return null;
+  }
   const user = db.users.find((u) => u.id === s.userId);
   if (!user) return null;
   s.lastSeen = now(); // cheap; flushed by the debounced save
-  return { token, user, impersonatorId: s.impersonatorId || null };
+  return { token, hash, user, impersonatorId: s.impersonatorId || null };
 }
 
 function requireSession(req) {
@@ -727,6 +938,111 @@ function requireSuperAdmin(req) {
   if (s.user.role !== "super_admin") throw forbidden("هذا الإجراء متاح لمالك الموقع فقط");
   return s;
 }
+
+/* ── Trusted devices (real, hashed, revocable) ── */
+
+function pruneTrustedDevices(user) {
+  if (!Array.isArray(user.trustedDevices)) { user.trustedDevices = []; return; }
+  const t = Date.now();
+  user.trustedDevices = user.trustedDevices.filter(
+    (d) => d && d.tokenHash && (!d.expiresAt || Date.parse(d.expiresAt) > t)
+  );
+}
+
+function findTrustedDevice(req, user) {
+  const raw = parseCookies(req)[DEVICE_COOKIE];
+  if (!raw || !user) return null;
+  pruneTrustedDevices(user);
+  const h = sha256(raw);
+  return user.trustedDevices.find((d) => d.tokenHash === h) || null;
+}
+
+function issueTrustedDevice(req, res, user, name) {
+  const token = crypto.randomBytes(32).toString("hex");
+  pruneTrustedDevices(user);
+  user.trustedDevices.push({
+    id: uid("dev"), name: String(name || "جهاز جديد").slice(0, 60),
+    tokenHash: sha256(token), createdAt: now(), lastUsedAt: now(),
+    expiresAt: new Date(Date.now() + TRUSTED_DEVICE_TTL_MS).toISOString(),
+  });
+  // keep at most the 10 newest remembered devices
+  if (user.trustedDevices.length > 10) user.trustedDevices = user.trustedDevices.slice(-10);
+  save();
+  appendCookies(res, [`${DEVICE_COOKIE}=${token}; ${cookieAttrs(req, TRUSTED_DEVICE_TTL_MS / 1000)}`]);
+  return token;
+}
+
+/** Any change that should force every remembered device to re-verify. */
+function revokeTrustedDevices(req, res, user) {
+  user.trustedDevices = [];
+  save();
+  appendCookies(res, [`${DEVICE_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${isSecureRequest(req) ? "; Secure" : ""}`]);
+}
+
+/* ── Password policy ── */
+
+// Tiny, dependency-free subset of the well-known worst passwords + obvious
+// patterns. Production requires 12+ chars and rejects these; dev stays at 8 so
+// the existing test accounts keep working.
+const COMMON_PASSWORDS = new Set([
+  "123456", "12345678", "123456789", "1234567890", "password", "password1",
+  "qwerty", "qwerty123", "111111", "000000", "admin", "admin123", "administrator",
+  "letmein", "welcome", "iloveyou", "monkey", "dragon", "abc123", "sunshine",
+  "princess", "football", "baseball", "master", "login", "passw0rd", "test1234",
+  "aaaaaaaa", "a1234567", "changeme", "default",
+]);
+
+function passwordMin() { return IS_PROD ? 12 : 8; }
+
+/** Throws a 400 for weak passwords; returns the (trimmed) password otherwise. */
+function checkPasswordPolicy(pw) {
+  const min = passwordMin();
+  if (typeof pw !== "string" || pw.length < min)
+    throw badRequest(`كلمة المرور يجب أن تكون ${min} أحرف على الأقل`);
+  // The "common password" blocklist only applies in production so the demo
+  // accounts the test suites rely on keep working in development.
+  if (!IS_PROD) return pw;
+  const low = pw.toLowerCase();
+  if (COMMON_PASSWORDS.has(low)) throw badRequest("كلمة المرور شائعة جداً، اختر كلمة أقوى");
+  if (/^(.)\1+$/.test(pw)) throw badRequest("كلمة المرور ضعيفة جداً");
+  if (/^(?:123|000|abc|qwe|password|admin)/i.test(pw))
+    throw badRequest("كلمة المرور ضعيفة جداً");
+  return pw;
+}
+
+/* ── Login throttling (per IP + username) ── */
+
+const loginAttempts = new Map(); // key -> { count, until }
+const LOGIN_MAX = Number(process.env.LOGIN_MAX || (IS_PROD ? 10 : 12));
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+function clientIp(req) {
+  if (TRUST_PROXY) {
+    const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    if (fwd) return fwd;
+  }
+  return (req.socket && req.socket.remoteAddress) || "unknown";
+}
+
+function loginKey(req, username) {
+  return `${clientIp(req)}|${String(username || "").toLowerCase()}`;
+}
+
+function assertNotLockedOut(req, username) {
+  const r = loginAttempts.get(loginKey(req, username));
+  if (r && r.until > Date.now() && r.count >= LOGIN_MAX)
+    throw new AppError(429, "عدد محاولات الدخول كبير. حاول مرة أخرى بعد ١٥ دقيقة.");
+}
+
+function recordLoginFailure(req, username) {
+  const key = loginKey(req, username);
+  const r = loginAttempts.get(key) || { count: 0, until: 0 };
+  if (r.until <= Date.now()) { r.count = 0; r.until = Date.now() + LOGIN_WINDOW_MS; }
+  r.count++;
+  loginAttempts.set(key, r);
+}
+
+function clearLoginFailures(req, username) { loginAttempts.delete(loginKey(req, username)); }
 
 /**
  * Clinic owner = "admin" (صاحب عيادة). Site owner = "super_admin" (مالك الموقع).
@@ -749,6 +1065,37 @@ function ownedClinicIds(user) {
   if (user.clinicId) ids.add(user.clinicId);
   for (const c of db.clinics) if (c.ownerId === user.id) ids.add(c.id);
   return [...ids];
+}
+
+/**
+ * The clinic a create/write should target. A caller may only pass a clinicId
+ * they actually own; anything else is a hard 403 (never a silent fallback that
+ * could write into a stranger's clinic).
+ */
+function resolveWriteClinic(user, requested) {
+  const mine = user.clinicId || null;
+  if (!requested || requested === mine) {
+    if (mine) return mine;
+    if (isSiteOwner(user)) return (db.clinics[0] && db.clinics[0].id) || "";
+    throw forbidden("لا توجد عيادة مرتبطة بحسابك");
+  }
+  if (isSiteOwner(user) || ownedClinicIds(user).includes(requested)) return requested;
+  throw forbidden("لا يمكنك الوصول إلى عيادة أخرى");
+}
+
+/** Guard for editing/deleting a record that carries a clinicId. */
+function assertRecordClinic(user, record, label = "السجل") {
+  if (!record) throw notFound(`${label} غير موجود`);
+  if (isSiteOwner(user) || ownedClinicIds(user).includes(record.clinicId)) return record;
+  throw forbidden("لا يمكنك الوصول إلى سجل عيادة أخرى");
+}
+
+/** Records hang off a patient, so ownership is checked through the patient. */
+function ownedPatient(user, patientId) {
+  const p = db.patients.find((x) => x.id === patientId);
+  if (!p) throw notFound("المريض غير موجود");
+  if (isSiteOwner(user) || ownedClinicIds(user).includes(p.clinicId)) return p;
+  throw forbidden("لا يمكنك الوصول إلى مريض عيادة أخرى");
 }
 
 /* ── ROLES & PERMISSIONS ──
@@ -921,11 +1268,27 @@ function enforceSubscription(req, urlPath) {
   }
 }
 
+/** The only /api routes that may be reached without a signed-in user. Every
+ *  other route — including any added in the future — is deny-by-default and
+ *  must carry a valid session, even if it is not listed in PERMISSION_RULES. */
+const PUBLIC_API = [
+  /^\/api\/auth\/(?:register|login|logout)$/,
+  /^\/api\/health$/,
+  /^\/api\/public\//,
+  /^\/api\/subscriptions\/?$/,
+  /^\/api\/offers\/?$/,
+];
+
 function enforcePermission(req, urlPath) {
   const rule = PERMISSION_RULES.find(
     (r) => r.rx.test(urlPath) && (!r.methods || r.methods.includes(req.method))
   );
-  if (!rule) return; // auth, chat, plans, backup, public booking ... handled in-handler
+  if (!rule) {
+    // auth, chat, plans, backup, public booking ... are handled in-handler;
+    // this backstop still guarantees no /api route is anonymously reachable.
+    if (!PUBLIC_API.some((rx) => rx.test(urlPath))) requireSession(req);
+    return;
+  }
   const s = requireSession(req);
   if (rule.denyRoles && rule.denyRoles.includes(s.user.role))
     throw forbidden("ليست لديك صلاحية: المهام");
@@ -1056,9 +1419,14 @@ const sameDay = (iso, d) => {
 const clinicScope = (req, url) => {
   const requested = url.searchParams.get("clinicId");
   const session = currentSession(req);
-  const mine = session ? session.user.clinicId : null;
-  const id = requested || mine;
-  return id && clinicOf(id) ? id : mine;
+  const user = session ? session.user : null;
+  if (!user) return null;
+  const mine = user.clinicId || null;
+  // A ?clinicId= is honoured only when the caller actually owns that clinic,
+  // otherwise it is ignored (falls back to the caller's own clinic) — this
+  // closes the read-side IDOR where any member could read another clinic.
+  if (requested && (isSiteOwner(user) || ownedClinicIds(user).includes(requested))) return requested;
+  return mine;
 };
 
 function buildDashboard(clinicId, empty) {
@@ -1143,7 +1511,7 @@ route("POST", "/api/auth/register", async (req, res) => {
   if (!username || !password || !fullName) throw badRequest("جميع الحقول مطلوبة");
   if (!clinicName) throw badRequest("اسم العيادة مطلوب");
   if (username.length < 3) throw badRequest("اسم المستخدم يجب أن يكون ٣ أحرف على الأقل");
-  if (password.length < 8) throw badRequest("كلمة المرور يجب أن تكون ٨ أحرف على الأقل");
+  checkPasswordPolicy(password);
   if (db.users.some((u) => String(u.username).toLowerCase() === username.toLowerCase()))
     throw new AppError(409, "اسم المستخدم مستخدم بالفعل");
 
@@ -1179,8 +1547,9 @@ route("POST", "/api/auth/register", async (req, res) => {
   }
 
   const user = db.users.find((u) => u.id === userId);
-  createSession(res, userId);
+  createSession(req, res, userId);
   save();
+  audit(req, "register.success", { actorId: userId, username, detail: clinicId });
   json(res, 200, { user: publicUser(user), currentClinicId: clinicId });
 });
 
@@ -1189,29 +1558,39 @@ route("POST", "/api/auth/login", async (req, res) => {
   const username = String(b.username || "").trim();
   const password = String(b.password || "");
 
+  assertNotLockedOut(req, username);
+
   const user = db.users.find((u) => String(u.username).toLowerCase() === username.toLowerCase());
   // scrypt on a missing user too, so timing doesn't reveal which usernames exist
   const okPw = user
     ? verifyPassword(password, user.password)
     : (verifyPassword(password, hashPassword("dummy")), false);
 
-  if (!user || !okPw) throw new AppError(401, "اسم المستخدم أو كلمة المرور غير صحيحة");
+  if (!user || !okPw) {
+    recordLoginFailure(req, username);
+    audit(req, "login.failure", { username });
+    throw new AppError(401, "اسم المستخدم أو كلمة المرور غير صحيحة");
+  }
+  clearLoginFailures(req, username);
 
-  if (user.twoFactorEnabled && !b.trustDevice) {
-    if (!b.twoFactorCode) return json(res, 200, { requiresTwoFactor: true, userId: user.id });
-    if (!verifyTotp(user.twoFactorSecret, b.twoFactorCode)) throw new AppError(401, "رمز التحقق غير صحيح");
+  // 2FA is a hard gate: a correct password alone never yields a session. A
+  // remembered device may stand in for the code, but only if it was minted
+  // earlier with a valid TOTP code.
+  if (user.twoFactorEnabled) {
+    const trusted = b.trustDevice === true ? findTrustedDevice(req, user) : null;
+    if (!trusted) {
+      if (!b.twoFactorCode) return json(res, 200, { requiresTwoFactor: true, userId: user.id });
+      if (!verifyTotp(user.twoFactorSecret, b.twoFactorCode))
+        throw new AppError(401, "رمز التحقق غير صحيح");
+      if (b.trustDevice === true) issueTrustedDevice(req, res, user, b.deviceName);
+    } else {
+      trusted.lastUsedAt = now();
+      save();
+    }
   }
 
-  if (!user.twoFactorEnabled && b.trustDevice) {
-    if (!b.twoFactorCode)
-      return json(res, 200, {
-        requiresDeviceAuth: true, userId: user.id,
-        deviceName: b.deviceName || "جهاز جديد", _demoAuthCode: "123456",
-      });
-    if (String(b.twoFactorCode) !== "123456") throw new AppError(401, "رمز التحقق غير صحيح");
-  }
-
-  createSession(res, user.id);
+  createSession(req, res, user.id);
+  audit(req, "login.success", { actorId: user.id, username: user.username });
   json(res, 200, { user: publicUser(user), currentClinicId: user.clinicId });
 });
 
@@ -1231,7 +1610,9 @@ route("GET", "/api/auth/me", async (req, res) => {
 });
 
 route("POST", "/api/auth/logout", async (req, res) => {
+  const s = currentSession(req);
   clearSession(req, res);
+  audit(req, "logout", { actorId: s && s.user.id, username: s && s.user.username });
   json(res, 200, { success: true });
 });
 
@@ -1264,6 +1645,7 @@ route("POST", "/api/auth/2fa/enable", async (req, res) => {
   s.user.twoFactorEnabled = true;
   delete s.user.twoFactorPendingSecret;
   save();
+  audit(req, "2fa.enable");
   json(res, 200, { enabled: true });
 });
 
@@ -1275,7 +1657,10 @@ route("POST", "/api/auth/2fa/disable", async (req, res) => {
   s.user.twoFactorEnabled = false;
   delete s.user.twoFactorSecret;
   delete s.user.twoFactorPendingSecret;
+  // remembered devices only exist to skip 2FA; with 2FA off they go too
+  revokeTrustedDevices(req, res, s.user);
   save();
+  audit(req, "2fa.disable");
   json(res, 200, { enabled: false });
 });
 
@@ -1283,18 +1668,19 @@ route("POST", "/api/auth/change-password", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
   const next = String(b.newPassword || "");
-  if (next.length < 8)
-    throw badRequest("كلمة المرور الجديدة يجب أن تكون ٨ أحرف على الأقل");
   if (!verifyPassword(String(b.currentPassword || ""), s.user.password))
     throw badRequest("كلمة المرور الحالية غير صحيحة");
+  checkPasswordPolicy(next);
   if (verifyPassword(next, s.user.password))
     throw badRequest("كلمة المرور الجديدة مطابقة للحالية");
 
   s.user.password = hashPassword(next);
-  // every other device has to sign in again with the new password
-  for (const [token, sess] of Object.entries(db.sessions))
-    if (sess.userId === s.user.id && token !== s.token) delete db.sessions[token];
+  // every other session + every remembered device must sign in again
+  for (const h of userSessionHashes(s.user.id, s.hash)) delete sessions[h];
+  revokeTrustedDevices(req, res, s.user);
+  saveSessions();
   save();
+  audit(req, "change-password");
   json(res, 200, { success: true });
 });
 
@@ -1304,11 +1690,12 @@ route("POST", "/api/auth/impersonate", async (req, res) => {
   const target = db.users.find((u) => u.id === b.userId);
   if (!target) throw notFound("المستخدم غير موجود");
 
-  db.sessions[s.token].impersonatorId = s.user.id;
-  save();
+  sessions[s.hash].impersonatorId = s.user.id;
+  saveSessions();
+  audit(req, "impersonate.start", { detail: target.username });
   appendCookies(res, [
-    cookieHeader(s.token),
-    `impersonator_name=${encodeURIComponent(s.user.fullName)}; Path=/; SameSite=Lax; Max-Age=86400`,
+    `${SESSION_COOKIE}=${s.token}; ${cookieAttrs(req, LIMITS.sessionTtlMs / 1000)}`,
+    `impersonator_name=${encodeURIComponent(s.user.fullName)}; Path=/; SameSite=Lax; Max-Age=86400${isSecureRequest(req) ? "; Secure" : ""}`,
   ]);
   json(res, 200, {
     user: publicUser(target), currentClinicId: target.clinicId, impersonatorName: s.user.fullName,
@@ -1320,9 +1707,13 @@ route("DELETE", "/api/auth/impersonate", async (req, res) => {
   if (!s.impersonatorId) throw badRequest("لا يوجد وضع انتحال نشط");
 
   const owner = userOf(s.impersonatorId);
-  db.sessions[s.token].impersonatorId = null;
-  save();
-  appendCookies(res, [cookieHeader(s.token), "impersonator_name=; Path=/; SameSite=Lax; Max-Age=0"]);
+  sessions[s.hash].impersonatorId = null;
+  saveSessions();
+  audit(req, "impersonate.stop");
+  appendCookies(res, [
+    `${SESSION_COOKIE}=${s.token}; ${cookieAttrs(req, LIMITS.sessionTtlMs / 1000)}`,
+    `impersonator_name=; Path=/; SameSite=Lax; Max-Age=0${isSecureRequest(req) ? "; Secure" : ""}`,
+  ]);
   json(res, 200, {
     user: publicUser(owner), currentClinicId: owner ? owner.clinicId : null,
   });
@@ -1334,7 +1725,7 @@ route("GET", "/api/health", async (req, res) => {
   json(res, 200, {
     status: "ok",
     uptimeSec: Math.round((Date.now() - started) / 1000),
-    sessions: Object.keys(db.sessions).length,
+    sessions: Object.keys(sessions).length,
     memoryMB: Math.round(process.memoryUsage().rss / 1048576),
     node: process.version,
   });
@@ -1373,6 +1764,7 @@ route("POST", "/api/clinics", async (req, res) => {
   db.clinics.push(clinic);
   seedDefaultServices(clinic.id);
   save();
+  audit(req, "clinic.create", { detail: clinic.id });
   json(res, 200, clinic);
 });
 
@@ -1409,6 +1801,7 @@ route("PUT", "/api/clinics", async (req, res) => {
     clinic.siteClosed = closed;
   }
   save();
+  audit(req, "clinic.update", { detail: clinic.id });
   json(res, 200, clinic);
 });
 
@@ -1474,7 +1867,7 @@ route("POST", "/api/patients", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
   if (!String(b.fullName || "").trim()) throw badRequest("يرجى إدخال اسم المريض");
-  const clinicId = b.clinicId || s.user.clinicId;
+  const clinicId = resolveWriteClinic(s.user, b.clinicId);
   const patient = {
     id: uid("pat"), clinicId, fileNumber: nextPatientFileNumber(clinicId), fullName: b.fullName,
     phone: b.phone || "", email: b.email || "", gender: b.gender || "",
@@ -1489,20 +1882,21 @@ route("POST", "/api/patients", async (req, res) => {
 });
 
 route("PUT", "/api/patients", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const patient = db.patients.find((x) => x.id === b.id);
-  if (!patient) throw notFound("المريض غير موجود");
+  assertRecordClinic(s.user, patient, "المريض");
   for (const k of PATIENT_FIELDS) if (b[k] !== undefined) patient[k] = b[k];
   save();
   json(res, 200, patient);
 });
 
 route("DELETE", "/api/patients", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const i = db.patients.findIndex((x) => x.id === b.id);
   if (i < 0) throw notFound("المريض غير موجود");
+  assertRecordClinic(s.user, db.patients[i], "المريض");
   db.patients.splice(i, 1);
   db.records = db.records.filter((r) => r.patientId !== b.id);
   save();
@@ -1545,8 +1939,15 @@ route("GET", "/api/appointments", async (req, res, p, url) => {
 route("POST", "/api/appointments", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
-  const clinicId = b.clinicId || s.user.clinicId;
+  const clinicId = resolveWriteClinic(s.user, b.clinicId);
   const clinic = clinicOf(clinicId) || {};
+  // a patient/doctor from another clinic must never be attached
+  if (b.patientId) {
+    const pat = db.patients.find((x) => x.id === b.patientId);
+    if (!pat || pat.clinicId !== clinicId) throw badRequest("المريض المحدد غير موجود في هذه العيادة");
+  }
+  if (b.doctorId && !db.users.some((u) => u.id === b.doctorId && u.clinicId === clinicId))
+    throw badRequest("الطبيب المحدد غير موجود في هذه العيادة");
 
   const start = b.startTime ? new Date(b.startTime) : new Date();
   if (Number.isNaN(start.getTime())) throw badRequest("تاريخ الموعد غير صالح");
@@ -1572,10 +1973,16 @@ route("POST", "/api/appointments", async (req, res) => {
 });
 
 route("PUT", "/api/appointments", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const appt = db.appointments.find((a) => a.id === b.id);
-  if (!appt) throw notFound("الموعد غير موجود");
+  assertRecordClinic(s.user, appt, "الموعد");
+  if (b.patientId) {
+    const pat = db.patients.find((x) => x.id === b.patientId);
+    if (!pat || pat.clinicId !== appt.clinicId) throw badRequest("المريض المحدد غير موجود في هذه العيادة");
+  }
+  if (b.doctorId && !db.users.some((u) => u.id === b.doctorId && u.clinicId === appt.clinicId))
+    throw badRequest("الطبيب المحدد غير موجود في هذه العيادة");
   const EDITABLE = ["patientId", "doctorId", "title", "type", "status", "notes", "startTime", "endTime"];
   const prev = {};
   for (const k of EDITABLE) prev[k] = appt[k];
@@ -1583,10 +1990,10 @@ route("PUT", "/api/appointments", async (req, res) => {
 
   // re-check after the move, otherwise dragging an appointment on top of
   // another one silently double-books the doctor
-  const s = new Date(appt.startTime).getTime();
+  const st = new Date(appt.startTime).getTime();
   const e = new Date(appt.endTime).getTime();
-  if (Number.isFinite(s) && Number.isFinite(e) &&
-      appointmentClashes(appt.clinicId, appt.doctorId, s, e, appt.id)) {
+  if (Number.isFinite(st) && Number.isFinite(e) &&
+      appointmentClashes(appt.clinicId, appt.doctorId, st, e, appt.id)) {
     for (const k of EDITABLE) appt[k] = prev[k];
     throw new AppError(409, "هذا الوقت يتعارض مع موعد موجود للطبيب نفسه");
   }
@@ -1596,10 +2003,11 @@ route("PUT", "/api/appointments", async (req, res) => {
 });
 
 route("DELETE", "/api/appointments", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const i = db.appointments.findIndex((a) => a.id === b.id);
   if (i < 0) throw notFound("الموعد غير موجود");
+  assertRecordClinic(s.user, db.appointments[i], "الموعد");
   db.appointments.splice(i, 1);
   save();
   json(res, 200, { success: true });
@@ -1627,7 +2035,7 @@ route("POST", "/api/invoices", async (req, res) => {
   const paidAmount = num(b.paidAmount);
 
   const invoice = {
-    id: uid("inv"), clinicId: b.clinicId || s.user.clinicId, patientId: b.patientId || "",
+    id: uid("inv"), clinicId: resolveWriteClinic(s.user, b.clinicId), patientId: b.patientId || "",
     subtotal, insuranceDiscount: num(b.insuranceDiscount), taxPercentage, taxAmount, total,
     paidAmount, dueAmount: total - paidAmount,
     status: b.status || (total - paidAmount > 0 ? "pending" : "paid"),
@@ -1640,10 +2048,10 @@ route("POST", "/api/invoices", async (req, res) => {
 });
 
 route("PUT", "/api/invoices", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const invoice = db.invoices.find((i) => i.id === b.id);
-  if (!invoice) throw notFound("الفاتورة غير موجودة");
+  assertRecordClinic(s.user, invoice, "الفاتورة");
   for (const k of ["paidAmount", "status", "paymentMethod", "items"])
     if (b[k] !== undefined) invoice[k] = b[k];
   if (b.paidAmount !== undefined) {
@@ -1655,10 +2063,11 @@ route("PUT", "/api/invoices", async (req, res) => {
 });
 
 route("DELETE", "/api/invoices", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const i = db.invoices.findIndex((x) => x.id === b.id);
   if (i < 0) throw notFound("الفاتورة غير موجودة");
+  assertRecordClinic(s.user, db.invoices[i], "الفاتورة");
   db.invoices.splice(i, 1);
   save();
   json(res, 200, { success: true });
@@ -1682,7 +2091,7 @@ route("POST", "/api/users", async (req, res) => {
   const username = String(b.username || "").trim();
   const password = String(b.password || "");
   if (!username || !b.fullName) throw badRequest("اسم المستخدم والاسم الكامل مطلوبان");
-  if (password.length < 8) throw badRequest("كلمة المرور يجب أن تكون ٨ أحرف على الأقل");
+  checkPasswordPolicy(password);
   if (db.users.some((u) => String(u.username).toLowerCase() === username.toLowerCase()))
     throw new AppError(409, "اسم المستخدم مستخدم بالفعل");
 
@@ -1705,6 +2114,7 @@ route("POST", "/api/users", async (req, res) => {
   };
   db.users.push(user);
   save();
+  audit(req, "user.create", { detail: user.id });
   json(res, 200, publicUser(user));
 });
 
@@ -1726,6 +2136,9 @@ route("PUT", "/api/users", async (req, res) => {
 
   const isSelf = user.id === s.user.id;
   const managesStaff = !isSelf;
+  // never let a clinic owner touch a staff member of a different clinic
+  if (managesStaff && !isSiteOwner(s.user) && !new Set(ownedClinicIds(s.user)).has(user.clinicId))
+    throw forbidden("لا يمكنك تعديل مستخدم من عيادة أخرى");
   // editing someone else's account is staff management -> needs a paid subscription
   if (managesStaff && !isSiteOwner(s.user)) {
     requireHiringSubscription(req);
@@ -1758,10 +2171,15 @@ route("PUT", "/api/users", async (req, res) => {
   for (const k of ["fullName", "phone", "email", "twoFactorEnabled"])
     if (b[k] !== undefined) user[k] = b[k];
   if (b.password) {
-    if (String(b.password).length < 8) throw badRequest("كلمة المرور يجب أن تكون ٨ أحرف على الأقل");
+    checkPasswordPolicy(String(b.password));
     user.password = hashPassword(b.password);
+    // a password reset must invalidate every existing session + remembered device
+    for (const h of userSessionHashes(user.id)) delete sessions[h];
+    user.trustedDevices = [];
+    saveSessions();
   }
   save();
+  audit(req, "user.update", { detail: user.id + (b.password ? " (password reset)" : "") });
   json(res, 200, publicUser(user));
 });
 
@@ -1775,6 +2193,7 @@ route("DELETE", "/api/users", async (req, res) => {
     throw forbidden("لا يمكنك حذف مستخدم من عيادة أخرى");
   db.users.splice(i, 1);
   save();
+  audit(req, "user.delete", { detail: b.id });
   json(res, 200, { success: true });
 });
 
@@ -1810,15 +2229,18 @@ route("GET", "/api/roles", async (req, res) => {
 /* ── RECORDS ── */
 
 route("GET", "/api/records", async (req, res, p, url) => {
-  requireSession(req);
+  const s = requireSession(req);
   const patientId = url.searchParams.get("patientId");
   const clinicId = clinicScope(req, url);
+  const owned = new Set(ownedClinicIds(s.user));
 
   const list = db.records
     .filter((r) => {
-      if (patientId) return r.patientId === patientId;
       const pt = patientOf(r.patientId);
-      return !clinicId || (pt && pt.clinicId === clinicId);
+      // never cross the clinic boundary, even when a patientId is supplied
+      if (!pt || (!isSiteOwner(s.user) && !owned.has(pt.clinicId))) return false;
+      if (patientId) return r.patientId === patientId;
+      return !clinicId || pt.clinicId === clinicId;
     })
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
     .map((r) => {
@@ -1833,6 +2255,7 @@ route("POST", "/api/records", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
   if (!b.patientId) throw badRequest("المريض مطلوب");
+  ownedPatient(s.user, b.patientId);
   const record = {
     id: uid("rec"), patientId: b.patientId, doctorId: b.doctorId || s.user.id,
     chiefComplaint: b.chiefComplaint || "", diagnosis: b.diagnosis || "",
@@ -1844,20 +2267,22 @@ route("POST", "/api/records", async (req, res) => {
 });
 
 route("PUT", "/api/records", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const r = db.records.find((x) => x.id === b.id);
   if (!r) throw notFound("السجل غير موجود");
+  ownedPatient(s.user, r.patientId);
   for (const k of ["chiefComplaint", "diagnosis", "treatment", "notes"]) if (b[k] !== undefined) r[k] = b[k];
   save();
   json(res, 200, r);
 });
 
 route("DELETE", "/api/records", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const i = db.records.findIndex((x) => x.id === b.id);
   if (i < 0) throw notFound("السجل غير موجود");
+  ownedPatient(s.user, db.records[i].patientId);
   db.records.splice(i, 1);
   save();
   json(res, 200, { success: true });
@@ -2031,7 +2456,7 @@ route("POST", "/api/inventory", async (req, res) => {
   const b = await readBody(req);
   if (!b.itemName) throw badRequest("اسم الصنف مطلوب");
   const item = {
-    id: uid("inv_item"), clinicId: b.clinicId || s.user.clinicId, itemName: b.itemName,
+    id: uid("inv_item"), clinicId: resolveWriteClinic(s.user, b.clinicId), itemName: b.itemName,
     itemNameEn: b.itemNameEn || "", category: b.category || "supply",
     quantity: num(b.quantity), maxStock: num(b.maxStock), minStock: num(b.minStock),
     unitPrice: num(b.unitPrice), cost: num(b.cost), supplier: b.supplier || "", createdAt: now(),
@@ -2042,10 +2467,10 @@ route("POST", "/api/inventory", async (req, res) => {
 });
 
 route("PUT", "/api/inventory", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const item = db.inventory.find((i) => i.id === b.id);
-  if (!item) throw notFound("الصنف غير موجود");
+  assertRecordClinic(s.user, item, "الصنف");
   for (const k of ["itemName", "itemNameEn", "category", "quantity", "maxStock",
     "minStock", "unitPrice", "cost", "supplier"]) {
     if (b[k] !== undefined) item[k] = INV_NUMERIC.has(k) ? num(b[k]) : b[k];
@@ -2055,10 +2480,11 @@ route("PUT", "/api/inventory", async (req, res) => {
 });
 
 route("DELETE", "/api/inventory", async (req, res) => {
-  requireSession(req);
+  const s = requireSession(req);
   const b = await readBody(req);
   const i = db.inventory.findIndex((x) => x.id === b.id);
   if (i < 0) throw notFound("الصنف غير موجود");
+  assertRecordClinic(s.user, db.inventory[i], "الصنف");
   db.inventory.splice(i, 1);
   save();
   json(res, 200, { success: true });
@@ -2552,8 +2978,14 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
   const doctorId = String(b.doctorId || "");
 
   if (name.length < 3) throw badRequest("الاسم مطلوب (٣ أحرف على الأقل)");
+  if (name.length > 80) throw badRequest("الاسم طويل جداً");
   if (!/^[\d+\-\s()]{7,20}$/.test(phone)) throw badRequest("رقم جوال غير صالح");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw badRequest("التاريخ غير صالح");
+  // A real clock time is required when one is supplied — otherwise "99:99"
+  // silently fell through to the earliest free slot and booked it.
+  if (wanted && !/^([01]\d|2[0-3]):[0-5]\d$/.test(wanted)) throw badRequest("الوقت غير صالح");
+  const email = String(b.email || "").trim();
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw badRequest("البريد الإلكتروني غير صالح");
 
   if (doctorId && !db.users.some((u) => u.id === doctorId && u.clinicId === clinic.id))
     throw badRequest("الطبيب المحدد غير موجود");
@@ -2595,7 +3027,7 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
   if (!patient) {
     patient = {
       id: uid("pat"), clinicId: clinic.id, fullName: name, gender: b.gender || "",
-      age: num(b.age, 0), phone, email: String(b.email || ""),
+      age: Math.min(130, Math.max(0, num(b.age, 0))), phone, email,
       bloodType: "", allergies: "", source: "booking", createdAt: now(),
     };
     db.patients.push(patient);
@@ -2668,9 +3100,63 @@ route("POST", "/api/backup/export", async (req, res) => {
     "Content-Type": MIME[".json"],
     "Content-Disposition": `attachment; filename="clinic-backup-${Date.now()}.json"`,
   });
+  audit(req, "backup.export");
 });
 
-/* ══════════════════════════ 9. STATIC FILES ══════════════════════════ */
+/* ══════════════════════════ 9. STATIC FILES ══════════════════════════
+ * Deny-by-default: only a small, explicit allowlist of public assets is ever
+ * served. Everything else (server.js, the data/ folder, tools/, tests, dotfiles,
+ * any .json except the web manifest, backups, source files) 404s — even though
+ * it technically lives under ROOT.
+ */
+
+const STATIC_ALLOW = [
+  /^\/$/,
+  /^\/index\.html$/i,
+  /^\/booking-page\.js$/i,
+  /^\/favicon\.(?:ico|svg|png|webmanifest)$/i,
+  /^\/manifest\.json$/i,
+  /^\/robots\.txt$/i,
+  /^\/_next\/static\/[A-Za-z0-9._\/-]+$/,
+  /^\/lib\/[A-Za-z0-9._\/-]+$/,
+  /^\/docs\/screenshots\/[A-Za-z0-9._-]+\.png$/i,
+];
+// Folders that must never be web-reachable, whatever their contents.
+const STATIC_BLOCK_DIRS = new Set(["data", "tools", "tests", "node_modules", ".git", ".github", "backups"]);
+
+/** Rejects dotfiles, traversal segments and private folders. */
+function staticSegmentsSafe(p) {
+  for (const seg of p.split("/").filter(Boolean)) {
+    if (seg === "." || seg === "..") return false;
+    if (seg.startsWith(".")) return false; // .gitignore, .env, .git, ...
+    if (STATIC_BLOCK_DIRS.has(seg.toLowerCase())) return false;
+  }
+  return true;
+}
+
+/** True only for paths on the public allowlist (checked before touching disk). */
+function staticPathAllowed(rawPath) {
+  let p;
+  try { p = decodeURIComponent(rawPath); } catch { return false; }
+  if (p.includes("\0")) return false;
+  if (!staticSegmentsSafe(p)) return false;
+
+  const segs = p.split("/").filter(Boolean);
+  const last = (segs[segs.length - 1] || "").toLowerCase();
+  const isManifest = last === "manifest.json";
+  if (!isManifest && /\.(?:json|md|log|env|bak|tmp|orig|orig2|db|sqlite|sqlite3|yml|yaml|map)$/.test(last))
+    return false;
+  if (last.endsWith(".pre-ui8")) return false;
+  return STATIC_ALLOW.some((rx) => rx.test(p));
+}
+
+/** Client-side routes may fall back to the app shell, but never dotfiles/private dirs. */
+function spaFallbackAllowed(rawPath) {
+  let p;
+  try { p = decodeURIComponent(rawPath); } catch { return false; }
+  if (p.includes("\0") || !staticSegmentsSafe(p)) return false;
+  return !path.extname(p) || p.endsWith("/");
+}
 
 /** Returns an absolute path inside ROOT, or null if it escapes / is unusable. */
 function resolveStatic(rawPath) {
@@ -2735,7 +3221,8 @@ function pipeFile(req, res, file, st, cacheControl) {
 }
 
 async function serveStatic(req, res, urlPath) {
-  const target = resolveStatic(urlPath);
+  // deny-by-default gate first: never even stat a non-allowlisted path
+  const target = staticPathAllowed(urlPath) ? resolveStatic(urlPath) : null;
 
   if (target) {
     let st = await statOrNull(target);
@@ -2751,7 +3238,7 @@ async function serveStatic(req, res, urlPath) {
   }
 
   // SPA fallback — the app is client-side routed, so unknown paths get the shell.
-  if (!path.extname(urlPath)) {
+  if (spaFallbackAllowed(urlPath)) {
     const shell = path.join(ROOT, "index.html");
     const st = await statOrNull(shell);
     if (st && st.isFile()) return pipeFile(req, res, shell, st, "no-store");
@@ -2764,6 +3251,34 @@ async function serveStatic(req, res, urlPath) {
 
 const ALLOWED_ORIGIN = process.env.ORIGIN || null;
 
+/** Hardened response headers applied to EVERY response (API, static, shell). */
+function securityHeaders(req, res) {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=(), usb=()");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  // The exported SPA + booking page both embed a small inline <script> and use
+  // inline style attributes, so 'unsafe-inline' is required for script/style.
+  // Everything else is locked to same-origin and objects are disabled.
+  res.setHeader("Content-Security-Policy", [
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; "));
+  if (isSecureRequest(req)) {
+    res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
+  }
+}
+
 function cors(req, res) {
   const origin = req.headers.origin;
   if (origin && (!ALLOWED_ORIGIN || origin === ALLOWED_ORIGIN)) {
@@ -2771,11 +3286,70 @@ function cors(req, res) {
     res.setHeader("Vary", "Origin");
   } else if (!origin) {
     res.setHeader("Access-Control-Allow-Origin", "*");
+  } else {
+    res.setHeader("Vary", "Origin"); // non-matching origin: never reflected
   }
   res.setHeader("Access-Control-Allow-Credentials", "true");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,PATCH,OPTIONS");
-  res.setHeader("X-Content-Type-Options", "nosniff");
+  securityHeaders(req, res);
+}
+
+/* ── Rate limiting (in-memory token buckets keyed by client IP) ──
+ * The first matching rule wins; requests are only throttled under /api/ so
+ * static assets and the app shell are never affected. */
+
+const rateBuckets = new Map(); // "name:ip" -> { count, reset }
+const RATE_RULES = [
+  { name: "login", test: (p) => p === "/api/auth/login", max: IS_PROD ? 15 : 150, windowMs: 60_000 },
+  { name: "auth", test: (p) => p.startsWith("/api/auth/"), max: IS_PROD ? 60 : 600, windowMs: 60_000 },
+  { name: "booking", test: (p) => p.startsWith("/api/public/"), max: IS_PROD ? 120 : 1200, windowMs: 60_000 },
+  { name: "api", test: () => true, max: IS_PROD ? 300 : 5000, windowMs: 60_000 },
+];
+
+function checkRate(req, urlPath) {
+  const ip = clientIp(req);
+  const nowMs = Date.now();
+  const rule = RATE_RULES.find((r) => r.test(urlPath));
+  if (!rule) return;
+  const key = `${rule.name}:${ip}`;
+  let b = rateBuckets.get(key);
+  if (!b || b.reset <= nowMs) { b = { count: 0, reset: nowMs + rule.windowMs }; rateBuckets.set(key, b); }
+  b.count++;
+  if (b.count > rule.max) throw new AppError(429, "طلبات كثيرة جداً — حاول بعد قليل");
+}
+
+function pruneRateBuckets() {
+  const nowMs = Date.now();
+  for (const [k, b] of rateBuckets) if (b.reset <= nowMs) rateBuckets.delete(k);
+}
+
+/* ── CSRF defence ──
+ * Cookies are SameSite=Lax (a cross-site form post won't carry them), and any
+ * request that carries a body MUST be application/json — something a cross-site
+ * HTML form cannot produce without a CORS preflight. A mismatched Origin is
+ * rejected outright when present. */
+
+const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+function assertRequestSafe(req) {
+  if (!UNSAFE_METHODS.has(req.method)) return;
+
+  const origin = req.headers.origin;
+  if (origin) {
+    let ok = false;
+    try { ok = ALLOWED_ORIGIN ? origin === ALLOWED_ORIGIN : new URL(origin).host === req.headers.host; }
+    catch { ok = false; }
+    if (!ok) throw forbidden("طلب من أصل غير مسموح");
+  }
+
+  const len = Number(req.headers["content-length"]);
+  const hasBody = (Number.isFinite(len) && len > 0) || !!req.headers["transfer-encoding"];
+  if (hasBody) {
+    const ct = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+    if (ct !== "application/json")
+      throw new AppError(415, "نوع المحتوى يجب أن يكون application/json");
+  }
 }
 
 async function handle(req, res) {
@@ -2798,6 +3372,13 @@ async function handle(req, res) {
   }
 
   if (urlPath.startsWith("/api/")) {
+    try { checkRate(req, urlPath); assertRequestSafe(req); }
+    catch (e) {
+      const status = e instanceof AppError ? e.status : 500;
+      respond(res, status, { error: e.message });
+      return;
+    }
+
     const match = routes.find((r) => r.method === req.method && r.rx.test(urlPath));
     if (!match) {
       const pathExists = routes.some((r) => r.rx.test(urlPath));
@@ -2824,6 +3405,11 @@ async function handle(req, res) {
   }
 
   if (req.method === "GET" || req.method === "HEAD") {
+    // liveness/readiness probe for a reverse proxy or orchestrator
+    if (urlPath === "/healthz" || urlPath === "/readyz") {
+      respond(res, 200, "ok");
+      return;
+    }
     // public booking page: /booking/<slug>
     const bmatch = urlPath.match(/^\/booking\/([^/]+)\/?$/);
     if (bmatch) {
@@ -2892,8 +3478,10 @@ function shutdown(signal) {
   closing = true;
   log(`${signal} received — shutting down gracefully...`);
   clearInterval(sweeper);
+  clearInterval(backupTimer);
   server.close(() => {
     flush().finally(() => {
+      runBackup("shutdown");
       log("goodbye.");
       process.exit(0);
     });
@@ -2946,40 +3534,63 @@ function listen(port, host, attemptsLeft = 12) {
 
 const sweeper = setInterval(() => {
   try {
-    const removed = pruneSessions(db);
+    const removed = pruneSessions();
     if (removed) {
-      save();
+      saveSessions();
       log(`swept ${removed} expired session(s)`);
     }
+    pruneRateBuckets();
   } catch (e) {
     fail("session sweeper error:", e.message); // never let the interval die
   }
 }, LIMITS.sessionSweepMs);
 if (sweeper.unref) sweeper.unref();
 
+const backupTimer = setInterval(() => runBackup("scheduled"), LIMITS.backupIntervalMs);
+if (backupTimer.unref) backupTimer.unref();
+
 function banner(actualPort) {
   const mem = Math.round(process.memoryUsage().rss / 1048576);
+  const creds = IS_PROD
+    ? "     الإنتاج     تم تعطيل كلمات المرور التجريبية (راجع السجل)"
+    : `     حسابات تجريبية:
+       admin      / admin123       مدير عام
+       doctor     / doctor123      طبيب
+       reception  / reception123   استقبال`;
   console.log(`
-  ┌──────────────────────────────────────────────┐
-  │   نظام عيادة — يعمل محلياً                    │
-  └──────────────────────────────────────────────┘
+  ==============================================
+    نظام عيادة — يعمل${IS_PROD ? " (إنتاج)" : " محلياً"}
+  ==============================================
 
      ▸ الموقع     http://${HOST}:${actualPort}
      ▸ الصحة      http://${HOST}:${actualPort}/api/health
      ▸ Node       ${process.version}   (RSS ${mem} MB)
 
-     حسابات تجريبية:
-       admin      / admin123       مدير عام
-       doctor     / doctor123      طبيب
-       reception  / reception123   استقبال
+${creds}
 
-     البيانات    data/db.json
-     السجل       data/server.log
+     البيانات    ${path.relative(path.resolve(ROOT), DATA_DIR) || DATA_DIR}
+     السجل       ${path.join(path.relative(path.resolve(ROOT), DATA_DIR) || DATA_DIR, "server.log")}
      إيقاف       Ctrl+C
 `);
 }
 
+function startupChecks() {
+  const rel = path.relative(path.resolve(ROOT), path.resolve(DATA_DIR));
+  if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+    warn(`DATA_DIR is inside the web root (${DATA_DIR}). The static allowlist blocks it,`);
+    warn("but production should point DATA_DIR at a folder outside the deploy directory.");
+  }
+  if (IS_PROD && !ALLOWED_ORIGIN)
+    warn("NODE_ENV=production without ORIGIN set: CORS will only accept same-host origins.");
+  if (IS_PROD && HOST !== "127.0.0.1" && HOST !== "localhost" && !TRUST_PROXY)
+    warn("listening on a public interface without TRUST_PROXY=1: client IP throttling may see the proxy IP.");
+  if (!ENCRYPTION_KEY)
+    warn("ENCRYPTION_KEY is unset: medical fields (blood type, allergies, record notes) are stored in clear.");
+}
+
 processAliveHooks();
+startupChecks();
 load();
+runBackup("boot");
 listen(PORT, HOST);
 server.on("listening", () => banner(server.address().port));

@@ -8,7 +8,7 @@
 const http = require("http");
 const fs = require("fs");
 
-const DB = "C:\\Users\\911ho\\Desktop\\bank\\data\\db.json";
+const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
 // every suite prefixes its throwaway accounts so cleanup can find them safely
 const PROBE = /^(sv|sw|ta|tb|zz|doc\d*|probe|pwtest|staffprobe|diag|lock|st)[a-z0-9]*$/i;
 // seeded demo accounts that must survive

@@ -8,7 +8,7 @@ const { spawn, spawnSync } = require("child_process");
 const http = require("http");
 const path = require("path");
 
-const APP_DIR = "C:\\Users\\911ho\\Desktop\\bank";
+const APP_DIR = path.join(__dirname, "..");
 const SUITES = process.argv.slice(2);
 if (!SUITES.length) {
   console.error("usage: node run-suite.js <suite.js> [suite.js ...]");

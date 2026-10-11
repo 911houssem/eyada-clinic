@@ -3,7 +3,7 @@
 // change-password, and service-driven slot durations.
 const http = require("http");
 const fs = require("fs");
-const DB = "C:\\Users\\911ho\\Desktop\\bank\\data\\db.json";
+const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
 
 let pass = 0, fail = 0;
 function check(name, ok, extra) {

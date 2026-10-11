@@ -2,8 +2,8 @@
 // migrate() has already had its chance to prune and repair.
 const fs = require("fs");
 const http = require("http");
-const DB = "C:\\Users\\911ho\\Desktop\\bank\\data\\db.json";
-const BUNDLE = "C:\\Users\\911ho\\Desktop\\bank\\_next\\static\\chunks\\1fds2h4vn64um.js";
+const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data\\db.json";
+const BUNDLE = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\_next\\static\\chunks\\1fds2h4vn64um.js";
 const db = JSON.parse(fs.readFileSync(DB, "utf8"));
 
 let pass = 0, fail = 0;
@@ -92,7 +92,7 @@ const get = (p) => new Promise((res) => {
   check("bundle support mailto present", themed.includes("911houssem@gmail.com"));
   check("owner panel appears exactly once", themed.split("حالة الاشتراك").length - 1 === 1);
   console.log(`  init=${themed.includes('localStorage.getItem("theme")')} persist=${themed.includes('localStorage.setItem("theme","light")')}`);
-  const serverSrc = fs.readFileSync("C:\\Users\\911ho\\Desktop\\bank\\server.js", "utf8");
+  const serverSrc = fs.readFileSync("C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\server.js", "utf8");
   check("server.js has no U+FFFD", !serverSrc.includes("\uFFFD"));
 
   console.log(`\n   PASS ${pass}   FAIL ${fail}\n`);

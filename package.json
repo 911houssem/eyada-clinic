@@ -1,0 +1,17 @@
+{
+  "name": "eyada-clinic",
+  "version": "1.0.0",
+  "private": true,
+  "description": "نظام عيادة — zero-dependency clinic management server + static Next.js export",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tests/run-suite.js test-fixes.js test-plans-tasks.js test-modules.js test-theme.js",
+    "test:backend": "node tests/run-suite.js test-fixes.js test-p2.js test-appt.js test-plans-tasks.js test-modules.js test-services-booking.js test-theme.js",
+    "test:ui": "node tests/run-suite.js test-modui.js test-booking-page.js test-booking-render.js test-booking-mobile.js test-ui8.js",
+    "test:all": "node tests/run-suite.js test-fixes.js test-p2.js test-appt.js test-plans-tasks.js test-modules.js test-services-booking.js test-theme.js test-modui.js test-booking-page.js test-booking-render.js test-booking-mobile.js test-ui8.js"
+  }
+}

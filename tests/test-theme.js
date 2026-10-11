@@ -1,7 +1,7 @@
 // Verify the patched theme handlers behave correctly in a fake DOM.
 const fs = require("fs");
 const vm = require("vm");
-const FILE = "C:\\Users\\911ho\\Desktop\\bank\\_next\\static\\chunks\\1fds2h4vn64um.js";
+const FILE = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\_next\\static\\chunks\\1fds2h4vn64um.js";
 const src = fs.readFileSync(FILE, "utf8");
 
 let pass = 0, fail = 0;

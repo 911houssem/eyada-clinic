@@ -7,7 +7,7 @@
 //    create/move, while back-to-back appointments stay legal
 const http = require("http");
 const fs = require("fs");
-const ROOT = "C:\\Users\\911ho\\Desktop\\bank";
+const ROOT = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main";
 const DB = ROOT + "\\data\\db.json";
 
 let pass = 0, fail = 0;

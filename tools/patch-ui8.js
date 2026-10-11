@@ -8,7 +8,7 @@
  * Idempotent: refuses to run twice.
  */
 const fs = require("fs");
-const B = "C:\\Users\\911ho\\Desktop\\bank\\_next\\static\\chunks\\1fds2h4vn64um.js";
+const B = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\_next\\static\\chunks\\1fds2h4vn64um.js";
 
 const MARK = "ui8-lock-screen";
 let c = fs.readFileSync(B, "utf8");

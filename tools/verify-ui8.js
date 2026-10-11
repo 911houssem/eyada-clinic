@@ -1,6 +1,6 @@
 const fs = require("fs");
 const vm = require("vm");
-const B = "C:\\Users\\911ho\\Desktop\\bank\\_next\\static\\chunks\\1fds2h4vn64um.js";
+const B = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\_next\\static\\chunks\\1fds2h4vn64um.js";
 const raw = fs.readFileSync(B);
 const c = raw.toString("utf8");
 const before = fs.readFileSync(B + ".pre-ui8");
