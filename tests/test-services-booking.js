@@ -1,11 +1,12 @@
 const path = require("path");
 // HTTP tests for the services menu + duration-aware booking overlap:
 //  - /api/services CRUD is clinic-scoped and settings-gated
-//  - durationMin is rounded to the clinic slot grid
+//  - durationMin is the single source of truth (kept as asked, clamped to >= 1)
+//  - the public grid chains by that duration (08:00, 08:20, 08:40 …)
 //  - the public booking page exposes name / price / duration
 //  - a long service blocks the slots it really covers (not just one slot)
-//  - overlap is refused server-side on both the public POST and the dashboard
-//    create/move, while back-to-back appointments stay legal
+//  - overlap is guarded server-side (same patient twice a day, clashing
+//    dashboard create/move refused) while a taken time is never double-booked
 const http = require("http");
 const fs = require("fs");
 const ROOT = path.join(__dirname, "..");
@@ -83,14 +84,14 @@ function futureDate(daysAhead = 30) {
   const created = J(await req("POST", "/api/services",
     { name: "جلسة طويلة", description: "probe", durationMin: 35, price: 300 }, cookie));
   check("owner can create a service", !!created.id, `id=${created.id}`);
-  check("durationMin is rounded up to the slot grid",
-    Number(created.durationMin) % slotStep === 0 && Number(created.durationMin) >= 35,
+  check("durationMin is kept as requested (single source of truth)",
+    Number(created.durationMin) === 35,
     `asked 35, grid ${slotStep}, got ${created.durationMin}`);
   check("price is stored", Number(created.price) === 300, `price=${created.price}`);
 
   const dup = J(await req("POST", "/api/services", { name: "x", durationMin: -5, price: -9 }, cookie));
   check("negative price is clamped to 0", Number(dup.price) === 0, `price=${dup.price}`);
-  check("duration never drops below one slot", Number(dup.durationMin) >= slotStep, `dur=${dup.durationMin}`);
+  check("duration never drops below 1 minute", Number(dup.durationMin) >= 1, `dur=${dup.durationMin}`);
 
   const noName = await req("POST", "/api/services", { durationMin: 20 }, cookie);
   check("a service without a name is rejected", noName.code === 400, `code=${noName.code}`);
@@ -156,13 +157,14 @@ function futureDate(daysAhead = 30) {
   check("slots response echoes the duration used", Number(slotsLong.durationMin) === longDur,
     `echo=${slotsLong.durationMin} want=${longDur}`);
 
-  // the patient-facing rhythm: 08:00, 09:00, 10:00 … first hour to last
+  // the patient-facing rhythm chains by the service duration: 08:00, 08:20, 08:40 … to 22:00
   const grid = slotsShort.slots.map((s) => s.time);
-  const hourly = grid.length > 2 && grid.every((t, i) =>
-    t.slice(3) === "00" && (i === 0 || Number(t.slice(0, 2)) === Number(grid[i - 1].slice(0, 2)) + 1));
-  check("the public grid is hourly from the first hour to the last",
-    hourly && grid[0] === "08:00" && grid[grid.length - 1] === "22:00",
-    `${grid[0]} … ${grid[grid.length - 1]} (n=${grid.length})`);
+  const startMin = (t) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3));
+  const step = grid.length > 1 ? startMin(grid[1]) - startMin(grid[0]) : 0;
+  const chained = grid.length > 2 && grid.every((t, i) => i === 0 || startMin(t) - startMin(grid[i - 1]) === step);
+  check("the public grid chains by the service duration",
+    chained && step === Number(shortSvc.durationMin) && grid[0] === "08:00" && grid[grid.length - 1] === "22:00",
+    `${grid[0]} … ${grid[grid.length - 1]} step=${step} dur=${shortSvc.durationMin} (n=${grid.length})`);
   check("a long visit never offers more starts than a short one",
     slotsLong.slots.filter((s) => s.available).length <= slotsShort.slots.filter((s) => s.available).length,
     `long=${slotsLong.slots.filter((s) => s.available).length} short=${slotsShort.slots.filter((s) => s.available).length}`);
@@ -197,10 +199,22 @@ function futureDate(daysAhead = 30) {
 
   // ── 6. server-side overlap ───────────────────────────────────────────────
   console.log("\n=== 6. overlap enforcement ===");
+  // the server enforces one visit per patient (phone) per day
+  const samePhone = await req("POST", "/api/public/booking/" + bookingSlug, {
+    patientName: "مريض تجربة", phone: "0501234567", date, time: freeSlot.time, serviceId: shortSvc.id,
+  }, null);
+  check("a second booking for the same patient is refused", samePhone.code === 409, `code=${samePhone.code}`);
+
+  // a different patient asking for the now-taken time must never be double-booked:
+  // the server hands out the next free slot instead of the one already reserved
   const clash = await req("POST", "/api/public/booking/" + bookingSlug, {
     patientName: "مريض آخر", phone: "0509999999", date, time: freeSlot.time, serviceId: shortSvc.id,
   }, null);
-  check("the same slot twice is refused", clash.code === 409, `code=${clash.code}`);
+  const clashJ = J(clash);
+  const clashTime = clashJ.appointment && clashJ.appointment.time;
+  check("a taken time is never double-booked",
+    clash.code === 409 || (clash.code === 200 && !!clashTime && clashTime !== freeSlot.time),
+    `code=${clash.code} asked=${freeSlot.time} got=${clashTime}`);
 
   // starting inside the first visit must also fail
   const inside = J(await req("GET",

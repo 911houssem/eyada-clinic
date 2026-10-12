@@ -50,10 +50,17 @@ const mins = (t) => Number(t.slice(11, 13)) * 60 + Number(t.slice(14, 16));
 (async () => {
   const db = JSON.parse(fs.readFileSync(DB, "utf8"));
   const clinic = db.clinics.find((c) => c.name && c.name.includes("النور")) || db.clinics[0];
-  const ownerRow = db.users.find((u) => u.clinicId === clinic.id && u.role === "admin")
-    || db.users.find((u) => u.role === "super_admin");
-  const ownerToken = await login(ownerRow.username, ["123456", "admin123", "admin", ownerRow.password]);
-  check("owner session token obtained", !!ownerToken, "user=" + ownerRow.username + " clinic=" + clinic.name);
+  const ownerCandidates = [
+    db.users.find((u) => u.username === "admin"),
+    db.users.find((u) => u.role === "super_admin"),
+    db.users.find((u) => u.clinicId === clinic.id && u.role === "admin"),
+  ].filter(Boolean);
+  let ownerToken = "", ownerName = "";
+  for (const row of ownerCandidates) {
+    const t = await login(row.username, ["admin123", "123456", "admin"]);
+    if (t) { ownerToken = t; ownerName = row.username; break; }
+  }
+  check("owner session token obtained", !!ownerToken, "user=" + ownerName + " clinic=" + clinic.name);
   if (!ownerToken) return done();
   const cookie = "eyada_session=" + ownerToken;
 

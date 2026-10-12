@@ -173,15 +173,23 @@ const reload = () => JSON.parse(fs.readFileSync(DB, "utf8"));
 
   /* ── 5. per-user permission overrides ── */
   console.log("\n--- owner creates an account with chosen permissions ---");
-  // a clinic whose owner password we actually know: the seeded one
-  const ownerRow = db.users.find((u) => u.clinicId === db.clinics[0].id && u.role === "admin")
-    || db.users.find((u) => u.role === "super_admin");
-  let oc = "";
-  for (const pw of ["123456", "admin123", "admin"]) {
-    const l = await req("POST", "/api/auth/login", { username: ownerRow.username, password: pw });
-    if (J(l).user) { oc = ck(l); break; }
+  // log in as a KNOWN seeded account: prefer the site owner, then the seeded
+  // clinic admin. A leftover clinic-owner from an earlier run must not shadow it
+  // (that is exactly what made this probe fail on a dirty database).
+  const candidates = [
+    db.users.find((u) => u.username === "admin"),
+    db.users.find((u) => u.role === "super_admin"),
+    db.users.find((u) => u.clinicId === db.clinics[0].id && u.role === "admin"),
+  ].filter(Boolean);
+  let oc = "", ocName = "";
+  for (const row of candidates) {
+    for (const pw of ["admin123", "123456", "admin"]) {
+      const l = await req("POST", "/api/auth/login", { username: row.username, password: pw });
+      if (J(l).user) { oc = ck(l); ocName = row.username; break; }
+    }
+    if (oc) break;
   }
-  check("owner signed in for the permission test", !!oc, "user=" + ownerRow.username);
+  check("owner signed in for the permission test", !!oc, "user=" + ocName);
   if (oc) {
     const st = await req("POST", "/api/users", {
       username: "st" + uniq, password: "test1234", fullName: "Custom Perms",
