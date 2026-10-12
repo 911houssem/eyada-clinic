@@ -308,7 +308,7 @@ const SENSITIVE_FIELDS = {
   // Identity/contact fields (name, phone, email, fileNumber, insurance refs,
   // appointment titles) stay searchable plaintext BY DESIGN — see the coverage
   // test (tests/test-encryption-coverage.js) which prints that list for review.
-  patients: ["bloodType", "allergies", "notes"],
+  patients: ["bloodType", "allergies", "notes", "fullName", "phone"],
   appointments: ["notes"],
   records: ["chiefComplaint", "diagnosis", "treatment", "notes"],
   // The TOTP seed is a live second factor: it must never sit in db.json in clear
@@ -926,6 +926,14 @@ const SAFE_SLUG = /^[a-z0-9][a-z0-9-]*$/;
     }
   }
 
+  // blind phone index for rows created before it existed (phones sealed at
+  // rest stay searchable by exact match; the re-seal happens on save)
+  let idxFilled = 0;
+  for (const p of db.patients) {
+    if (p.phone && !p.phoneIdx) { p.phoneIdx = phoneIndex(p.phone); idxFilled++; }
+  }
+  if (idxFilled) notes.push(`filled ${idxFilled} missing phoneIdx value(s)`);
+
   // every account needs an explicit role and a permission grant
   for (const u of db.users) {
     const role = normalizeRole(u.role);
@@ -1085,6 +1093,13 @@ const DEVICE_COOKIE = "eyada_device";
 const TRUSTED_DEVICE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 const sha256 = (v) => crypto.createHash("sha256").update(String(v)).digest("hex");
+
+/** Blind index for exact phone lookup without opening sealed values.
+ * Digits-only + SHA-256: equality-searchable, one-way, format-insensitive. */
+function phoneIndex(v) {
+  const digits = String(v || "").replace(/\D/g, "");
+  return digits ? sha256(digits) : "";
+}
 
 /** True when the request arrived over TLS (or we are told to assume so). */
 function isSecureRequest(req) {
@@ -2889,7 +2904,8 @@ route("POST", "/api/patients", async (req, res) => {
   const clinicId = resolveWriteClinic(s.user, b.clinicId);
   const patient = {
     id: uid("pat"), clinicId, fileNumber: nextPatientFileNumber(clinicId), fullName: b.fullName,
-    phone: b.phone || "", email: b.email || "", gender: b.gender || "",
+    phone: b.phone || "", phoneIdx: phoneIndex(b.phone || ""),
+    email: b.email || "", gender: b.gender || "",
     age: b.age === "" || b.age == null ? "" : num(b.age),
     bloodType: b.bloodType || "", allergies: b.allergies || "",
     insuranceNumber: b.insuranceNumber || "", insuranceCompany: b.insuranceCompany || "",
@@ -2906,6 +2922,7 @@ route("PUT", "/api/patients", async (req, res) => {
   const patient = db.patients.find((x) => x.id === b.id);
   assertRecordClinic(s.user, patient, "المريض");
   for (const k of PATIENT_FIELDS) if (b[k] !== undefined) patient[k] = b[k];
+  if (b.phone !== undefined) patient.phoneIdx = phoneIndex(patient.phone); // keep the blind index with the number
   save();
   json(res, 200, patient);
 });
@@ -4037,16 +4054,18 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
   if (b.serviceId && !service) throw badRequest("الخدمة المحددة غير متاحة");
   const durationMin = service ? serviceDuration(service) : DEFAULT_APPTMENT_MIN;
 
-  // One visit per person per day: match on the phone digits so different
-  // spellings of the same number can't sneak a second booking through.
-  const phoneDigits = (v) => String(v).replace(/\D/g, "");
-  const samePhoneDay = db.appointments.some((a) => {
+  // One visit per person per day: match on the blind phone index so different
+  // spellings of the same number can't sneak a second booking through — and
+  // the sealed number itself is never compared.
+  const wantIdx = phoneIndex(phone);
+  const idxOf = (p) => (p && p.phoneIdx) || phoneIndex(p && p.phone);
+  const samePhoneDay = wantIdx !== "" && db.appointments.some((a) => {
     if (a.clinicId !== clinic.id) return false;
     if (!isLive(a)) return false;
     if (a.status === "cancelled" || a.status === "canceled") return false;
     if (!a.startTime || ymd(new Date(a.startTime)) !== date) return false;
     const owner = db.patients.find((p2) => p2.id === a.patientId && isLive(p2));
-    return !!owner && phoneDigits(owner.phone) === phoneDigits(phone);
+    return !!owner && idxOf(owner) === wantIdx;
   });
   if (samePhoneDay)
     throw new AppError(409, "لديك موعد محجوز بالفعل في هذا اليوم — لا يمكن حجز أكثر من موعد واحد في نفس اليوم");
@@ -4067,11 +4086,13 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
     throw new AppError(409, "عذراً، انتهت المواعيد المتاحة في هذا اليوم — جرّب يوماً آخر");
 
   // reuse an existing patient with the same phone, otherwise create one
-  let patient = db.patients.find((p2) => p2.clinicId === clinic.id && p2.phone === phone && isLive(p2));
+  let patient = wantIdx !== ""
+    ? db.patients.find((p2) => p2.clinicId === clinic.id && isLive(p2) && idxOf(p2) === wantIdx)
+    : null;
   if (!patient) {
     patient = {
       id: uid("pat"), clinicId: clinic.id, fullName: name, gender: b.gender || "",
-      age: Math.min(130, Math.max(0, num(b.age, 0))), phone, email,
+      age: Math.min(130, Math.max(0, num(b.age, 0))), phone, phoneIdx: wantIdx, email,
       bloodType: "", allergies: "", source: "booking", createdAt: now(),
     };
     db.patients.push(patient);

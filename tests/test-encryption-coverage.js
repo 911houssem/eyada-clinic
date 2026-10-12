@@ -26,8 +26,8 @@ const TAG = `COV${Date.now().toString(36)}`.toUpperCase();
 
 // field -> marker. medical:true means "must be sealed at rest".
 const FIELDS = [
-  ["patients.fullName", `WsM ${TAG}Nm`, false],
-  ["patients.phone", `05${String(Math.floor(Math.random() * 90000000) + 10000000)}`, false],
+  ["patients.fullName", `WsM ${TAG}Nm`, true],
+  ["patients.phone", `05${String(Math.floor(Math.random() * 90000000) + 10000000)}`, true],
   ["patients.email", `${TAG.toLowerCase()}@example.test`, false],
   ["patients.bloodType", `BT-${TAG}`, true],
   ["patients.allergies", `AL-${TAG}`, true],
@@ -141,9 +141,16 @@ const newestBackup = () => {
   const plist = Array.isArray(got.json) ? got.json : (got.json?.patients || got.json?.items || []);
   const row = plist.find((x) => x.id === pid);
   check("API returns the medical notes in clear", row && row.notes === byField["patients.notes"].marker);
+  check("API returns the patient name in clear", row && row.fullName === byField["patients.fullName"].marker);
 
   await sleep(900); // let the debounced flush land
   const raw = fs.readFileSync(path.join(TMP, "db.json"), "utf8");
+  const dbj = JSON.parse(raw);
+  const savedPat = dbj.patients.find((x) => x.id === pid);
+  check("phone sealed on disk", savedPat && savedPat.phone !== byField["patients.phone"].marker && String(savedPat.phone).startsWith("enc:v1:"));
+  const crypto = require("crypto");
+  const wantIdx = crypto.createHash("sha256").update(byField["patients.phone"].marker.replace(/\D/g, "")).digest("hex");
+  check("blind phone index maintained (sha256 of digits)", savedPat && savedPat.phoneIdx === wantIdx, savedPat?.phoneIdx);
 
   for (const [field, { marker, medical }] of Object.entries(byField)) {
     const present = raw.includes(marker);

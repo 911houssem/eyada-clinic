@@ -157,7 +157,9 @@
 الحقول التالية بخوارزمية **AES-256-GCM** لحظة كتابة قاعدة البيانات، وتُفكّ عند
 القراءة:
 
-- `patients.bloodType`, `patients.allergies`, `patients.notes`
+- `patients.fullName`, `patients.phone`, `patients.bloodType`, `patients.allergies`, `patients.notes`
+  (مع `patients.phoneIdx` — فهرس أعمى `SHA-256` للأرقام فقط للبحث بالمطابقة
+  التامة دون فك التشفير)
 - `appointments.notes`
 - `records.chiefComplaint`, `records.diagnosis`, `records.treatment`, `records.notes`
 - `users.twoFactorSecret`, `users.twoFactorPendingSecret` (سرّ TOTP)
@@ -174,9 +176,10 @@
   الإقلاع بأن الحقول الطبية مخزّنة بدون تشفير.
 - **مفتاح مفقود ≠ فقدان بيانات**: عند غياب المفتاح أو اختلافه تبقى القيمة
   المشفّرة كما هي ولا يتعطّل الخادم (يجب استعادة المفتاح الأصلي لفكّها).
-- حقول الهوية/التواصل (الاسم، الهاتف، البريد، رقم الملف، التأمين، عناوين
-  المواعيد) تبقى نصاً صريحاً **عمداً** لأن البحث يعتمد عليها؛ راجع قائمة
-  `tests/test-encryption-coverage.js` التي تطبعها للمراجعة البشرية.
+- حقول الهوية/التواصل الأخرى (البريد، رقم الملف، التأمين، عناوين
+  المواعيد، أرقام هواتف الموظفين) تبقى نصاً صريحاً **عمداً** لأن البحث
+  يعتمد عليها؛ راجع قائمة `tests/test-encryption-coverage.js` التي تطبعها
+  للمراجعة البشرية.
 
 ### تدوير المفتاح (`--rotate-key`)
 1. أوقف الخادم وخذ نسخة احتياطية (`--verify-backup` للتحقق).
