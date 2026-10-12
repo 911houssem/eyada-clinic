@@ -80,7 +80,19 @@ node server.js
 
 - لخيارات المنفذ: `node server.js --port 3001` أو `node server.js --auto-port`.
 - عند أول تشغيل يُنشئ الخادم قاعدة بيانات تجريبية تلقائياً (ملف `data/db.json` غير مُضمّن في المستودع).
-- فحص الصحة/الجاهزية: <http://127.0.0.1:3000/healthz> (و `/api/health` للتفاصيل).
+- فحص الصحة/الجاهزية: <http://127.0.0.1:3000/healthz> (و `/api/health` للتفاصيل، بما فيها جاهزية القراءة/الكتابة وعمر النسخة الاحتياطية).
+
+### النسخ الاحتياطي والاستعادة
+
+```bash
+node server.js --verify-backup            # فحص أحدث نسخة (بصمة + JSON + فكّ التشفير)
+node server.js --restore data/backups/db-XXXX.json   # استعادة (يرفض إن كان الخادم يعمل)
+node scripts/restore.js --verify <file>   # نفس الأمر دون تشغيل الخادم
+```
+
+- كل نسخة يرافقها `<file>.sha256`؛ وبضبط `BACKUP_ENCRYPT_KEY` تُكتب مشفّرة كاملةً
+  (`db-<ts>.json.enc`). الاستعادة تأخذ نسخة أمان `pre-restore-<ts>.json` أولاً.
+- التفاصيل في [SECURITY.md](SECURITY.md) (قسم النسخ الاحتياطي وحدود مخزن JSON).
 
 ### حسابات التجربة
 
@@ -111,6 +123,7 @@ node server.js
 | `OWNER_USERNAME` + `OWNER_PASSWORD` | أول مالك في الإنتاج (12+ حرفاً) أو استخدم `--create-owner` |
 | `TRUST_PROXY=1` | خلف وكيل عكسي (لضبط IP الحقيقي و`X-Forwarded-Proto`) |
 | `ENCRYPTION_KEY` | **إلزامي في الإنتاج**: تشفير الحقول الطبية وسرّ TOTP على القرص (AES-256-GCM) |
+| `BACKUP_ENCRYPT_KEY` | اختياري: تشفير ملفات النسخ الاحتياطي كاملةً (سرّ مستقل عن مفتاح التشفير) |
 | `PORT` / `HOST` | منفذ وواجهة الاستماع |
 
 ## 🔁 نقاط API (المرحلة 2)
@@ -148,7 +161,7 @@ node server.js
 ## ✅ الاختبارات
 
 ```
-npm test          # المجموعات المستقرة (بلا متصفّح) + test-security + test-phase2 + test-phase3
+npm test          # المجموعات المستقرة (بلا متصفّح) + test-security + test-phase2..4
 npm run test:all  # كل المجموعات، بما فيها واجهات المتصفّح (تتطلّب Chrome)
 ```
 
@@ -167,6 +180,7 @@ npm run test:all  # كل المجموعات، بما فيها واجهات ال�
 server.js            الخادم + واجهات API + تقديم الملفات الثابتة
 booking-page.js      مُنشئ صفحة الحجز العامة المستقلة
 notifiers/           تجريد الإرسال (console للتطوير، واتساب كلاود، ويب هوك موقّع، SMTP واجهة)
+scripts/             أدوات النسخ الاحتياطي والاستعادة (backup.js، restore.js)
 index.html           هيكل عميل لوحة التحكم
 _next/               ملفات الواجهة المبنية (JS/CSS/الخطوط)
 tests/               مجموعات الاختبار + مشغّل run-suite + أداة CDP

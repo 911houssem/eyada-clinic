@@ -19,6 +19,7 @@ const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const notify = require("./notifiers");
+const backupLib = require("./scripts/backup.js");
 
 /* ══════════════════════════ 1. CONFIG ══════════════════════════ */
 
@@ -45,6 +46,8 @@ const argOf = (name) => {
   return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
 };
 const CREATE_OWNER = argv.includes("--create-owner");
+const RESTORE_FILE = argOf("restore");
+const VERIFY_BACKUP = argv.includes("--verify-backup");
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || argOf("port") || 3000);
@@ -137,30 +140,64 @@ function audit(req, action, meta = {}) {
 }
 
 /* ── Automatic backups (data/backups) ──
- * A plain copy of the (already atomic) db.json, rotated to keep the newest
- * LIMITS.backupKeep snapshots. Runs on boot and every backupIntervalMs.
+ * A copy of the (already atomic) db.json, rotated to keep the newest
+ * LIMITS.backupKeep snapshots. Each snapshot carries a `<file>.sha256` sidecar,
+ * and — when BACKUP_ENCRYPT_KEY is set — is stored whole-file encrypted
+ * (`db-<ts>.json.enc`). Runs on boot, every backupIntervalMs, and on shutdown.
  */
 function runBackup(reason = "scheduled") {
   try {
     if (!fs.existsSync(DB_FILE)) return null;
     fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    const name = `db-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
-    const dest = path.join(BACKUP_DIR, name);
-    fs.copyFileSync(DB_FILE, dest);
-    if (IS_PROD) chmodSafe(dest, 0o600);
-    const files = fs
-      .readdirSync(BACKUP_DIR)
-      .filter((f) => f.startsWith("db-") && f.endsWith(".json"))
-      .sort();
-    while (files.length > LIMITS.backupKeep) {
-      try { fs.unlinkSync(path.join(BACKUP_DIR, files.shift())); } catch { /* keep rotating */ }
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    let dest;
+    if (backupKey) {
+      dest = path.join(BACKUP_DIR, `db-${ts}.json.enc`);
+      fs.writeFileSync(dest, backupLib.encryptBuffer(fs.readFileSync(DB_FILE), backupKey));
+    } else {
+      dest = path.join(BACKUP_DIR, `db-${ts}.json`);
+      fs.copyFileSync(DB_FILE, dest);
     }
-    log(`backup written (${reason}) → ${path.join(path.basename(BACKUP_DIR), name)}`);
+    if (IS_PROD) chmodSafe(dest, 0o600);
+    backupLib.writeChecksum(dest);
+    if (IS_PROD) chmodSafe(dest + ".sha256", 0o600);
+    backupLib.rotateBackups(BACKUP_DIR, LIMITS.backupKeep);
+    log(`backup written (${reason}) → ${path.join(path.basename(BACKUP_DIR), path.basename(dest))}${backupKey ? " [encrypted]" : ""}`);
     return dest;
   } catch (e) {
     warn("backup failed:", e.message);
     return null;
   }
+}
+
+/** `--verify-backup [file]` — checksum + JSON(+decrypt) check, newest by default. */
+function verifyBackupCli(file) {
+  const target = file || backupLib.newestBackup(BACKUP_DIR);
+  if (!target || !fs.existsSync(target)) { fail("no backup to verify (looked in " + BACKUP_DIR + ")"); return false; }
+  const sum = backupLib.verifyChecksum(target);
+  let snap;
+  try { snap = backupLib.readSnapshot(target, backupKey); }
+  catch (e) { snap = { ok: false, reason: "decrypt-failed" }; }
+  const ok = snap.ok && sum.reason !== "checksum-mismatch";
+  log(`${ok ? "OK" : "FAIL"} ${path.basename(target)}  checksum=${sum.reason} json=${snap.ok ? "ok" : snap.reason}`);
+  return ok;
+}
+
+/** `--restore <file>` — validate + snapshot-current + overwrite db.json. */
+async function restoreCli(file) {
+  const res = await backupLib.restore({
+    dbFile: DB_FILE, backupDir: BACKUP_DIR, file,
+    host: HOST, port: PORT, key: backupKey, force: argv.includes("--force"),
+  });
+  if (!res.ok) {
+    if (res.reason === "server-running")
+      fail(`refusing to restore: a server is answering on ${HOST}:${PORT}. Stop it first (or pass --force).`);
+    else fail("restore refused:", res.reason, res.message || "");
+    return false;
+  }
+  log(`restored ${path.basename(res.from)} → ${DB_FILE}  (checksum verified: ${res.checksumVerified})`);
+  if (res.preRestore) log(`previous database snapshotted: ${path.basename(res.preRestore)}`);
+  return true;
 }
 
 /* ── Optional encryption at rest (AES-256-GCM) ──
@@ -176,6 +213,11 @@ const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
 const encKey = ENCRYPTION_KEY
   ? crypto.createHash("sha256").update(String(ENCRYPTION_KEY)).digest()
   : null;
+// Optional whole-file backup encryption (separate secret from ENCRYPTION_KEY so
+// the two can be rotated independently). When set, snapshots are written as
+// `db-<ts>.json.enc` (AES-256-GCM) and never contain the plaintext database.
+const BACKUP_ENCRYPT_KEY = process.env.BACKUP_ENCRYPT_KEY || null;
+const backupKey = BACKUP_ENCRYPT_KEY ? backupLib.deriveKey(BACKUP_ENCRYPT_KEY) : null;
 const SENSITIVE_FIELDS = {
   patients: ["bloodType", "allergies"],
   records: ["chiefComplaint", "diagnosis", "treatment", "notes"],
@@ -1982,12 +2024,30 @@ route("DELETE", "/api/auth/impersonate", async (req, res) => {
 /* ── HEALTH ── */
 
 route("GET", "/api/health", async (req, res) => {
-  json(res, 200, {
-    status: "ok",
+  // real liveness: can we still read AND write the data dir? a full disk or a
+  // read-only mount must show up here, not only when the next save() fails.
+  let dbRead = false, dbWrite = false;
+  try { fs.accessSync(DB_FILE, fs.constants.R_OK); dbRead = true; } catch { /* missing/locked */ }
+  try {
+    const probe = path.join(DATA_DIR, `.health-${process.pid}`);
+    fs.writeFileSync(probe, "ok");
+    fs.unlinkSync(probe);
+    dbWrite = true;
+  } catch { /* read-only or full */ }
+
+  let backupAgeSec = null;
+  const newest = backupLib.newestBackup(BACKUP_DIR);
+  if (newest) { try { backupAgeSec = Math.round((Date.now() - fs.statSync(newest).mtimeMs) / 1000); } catch { /* ignore */ } }
+
+  const healthy = dbRead && dbWrite;
+  json(res, healthy ? 200 : 503, {
+    status: healthy ? "ok" : "degraded",
     uptimeSec: Math.round((Date.now() - started) / 1000),
     sessions: Object.keys(sessions).length,
     memoryMB: Math.round(process.memoryUsage().rss / 1048576),
     node: process.version,
+    dbRead, dbWrite, backupAgeSec,
+    backups: backupLib.listBackups(BACKUP_DIR).length,
   });
 });
 
@@ -4441,14 +4501,24 @@ function createOwnerCli() {
 }
 
 processAliveHooks();
-startupChecks();
-load();
-if (CREATE_OWNER) {
-  createOwnerCli();
-  flush().then(() => process.exit(0)).catch(() => process.exit(1));
+
+if (RESTORE_FILE) {
+  restoreCli(path.resolve(RESTORE_FILE)).then((ok) => process.exit(ok ? 0 : 1));
+} else if (VERIFY_BACKUP) {
+  process.exit(verifyBackupCli(argOf("verify-backup")) ? 0 : 1);
 } else {
-  hardenPerms();
-  runBackup("boot");
-  listen(PORT, HOST);
-  server.on("listening", () => banner(server.address().port));
+  startupChecks();
+  load();
+  if (CREATE_OWNER) {
+    createOwnerCli();
+    flush().then(() => process.exit(0)).catch(() => process.exit(1));
+  } else {
+    hardenPerms();
+    // persist first so the boot backup snapshots the real file, then serve
+    flush().finally(() => {
+      runBackup("boot");
+      listen(PORT, HOST);
+      server.on("listening", () => banner(server.address().port));
+    });
+  }
 }
