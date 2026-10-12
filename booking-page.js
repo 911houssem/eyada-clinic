@@ -108,7 +108,7 @@ function buildBookingPage(opts) {
   .mb-name{font-weight:800;font-size:.95rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .mb-spacer{flex:1}
   .mb-call{display:inline-flex;align-items:center;gap:6px;font-size:.82rem;color:var(--brand);
-    text-decoration:none;font-weight:700;white-space:nowrap}
+    text-decoration:none;font-weight:700;white-space:nowrap;padding:10px 4px}
   .mb-call:hover{color:var(--brand-ink)}
 
   /* ── hero ───────────────────────────────────────────────── */
@@ -151,7 +151,7 @@ function buildBookingPage(opts) {
     background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:6px 12px}
   .status i{width:8px;height:8px;border-radius:50%;background:#34d399;animation:pulse 2.2s infinite}
   @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.55)}70%{box-shadow:0 0 0 9px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
-  .tg{width:42px;height:42px;border-radius:13px;background:rgba(255,255,255,.16);
+  .tg{width:44px;height:44px;border-radius:13px;background:rgba(255,255,255,.16);
     border:1px solid rgba(255,255,255,.3);color:#fff;cursor:pointer;display:grid;place-items:center;
     font-size:1.05rem;transition:transform .18s,background .18s}
   .tg:hover{background:rgba(255,255,255,.28);transform:rotate(-12deg)}
@@ -244,7 +244,9 @@ function buildBookingPage(opts) {
   @media(min-width:600px){.row{grid-template-columns:1fr 1fr}}
 
   /* ── day chips + doctors ────────────────────────────────── */
-  .days{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;margin-bottom:9px;scrollbar-width:thin}
+  .days{display:flex;gap:8px;overflow-x:auto;padding-bottom:6px;margin-bottom:9px;scrollbar-width:thin;
+    -webkit-overflow-scrolling:touch;scroll-snap-type:x proximity}
+  .day{scroll-snap-align:start}
   .days::-webkit-scrollbar{height:6px}
   .days::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px}
   .day{flex:0 0 auto;min-width:78px;text-align:center;border:1.5px solid var(--line);background:var(--card-2);
@@ -257,7 +259,7 @@ function buildBookingPage(opts) {
   .day[aria-pressed="true"] small{color:rgba(255,255,255,.85)}
   .docs{display:flex;flex-wrap:wrap;gap:9px}
   .doc{display:inline-flex;align-items:center;gap:8px;border:1.5px solid var(--line);background:var(--card-2);
-    border-radius:999px;padding:6px 14px 6px 7px;cursor:pointer;font:inherit;color:var(--fg);
+    border-radius:999px;padding:6px 14px 6px 7px;min-height:44px;cursor:pointer;font:inherit;color:var(--fg);
     font-size:.86rem;font-weight:600;transition:.16s}
   .doc .av{width:27px;height:27px;border-radius:50%;background:var(--card-3);color:var(--brand);
     display:grid;place-items:center;font-size:.76rem;font-weight:800;flex:0 0 auto}
@@ -425,13 +427,17 @@ function buildBookingPage(opts) {
   @media(max-width:560px){
     .hero{padding:18px 15px 72px}
     .hero h1{font-size:1.34rem}
+    .eyebrow{font-size:.78rem}
     .logo{width:48px;height:48px;border-radius:15px;font-size:1.3rem}
     .hero-in{gap:12px}
     .hero-tools{gap:8px}
     .status{display:none}
     .hero-meta{gap:7px}
     .hero-meta a,.hero-meta span{font-size:.79rem;padding:5px 11px}
+    .hero-meta a{min-height:44px}
     .hero-strip{gap:6px 14px;font-size:.74rem}
+    .day small{font-size:.78rem}
+    .auto-head .ae,.next-badge,.bb-k,.sum-edit{font-size:.78rem}
     .wrap{padding:0 13px 104px;margin-top:-46px;gap:15px}
     .card{padding:18px;border-radius:18px}
     .form-head{gap:12px}

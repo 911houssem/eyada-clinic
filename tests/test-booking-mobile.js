@@ -12,7 +12,7 @@ const r = spawnSync(CHROME, [
   "--virtual-time-budget=8000", "--window-size=420,1600", "--dump-dom", URL,
 ], { encoding: "utf8", timeout: 120000, maxBuffer: 64 * 1024 * 1024 });
 
-const dom = (r.stdout || "").replace(/<script>[\s\S]*?<\/script>/g, "");
+const dom = (r.stdout || "").replace(/<script[^>]*>[\s\S]*?<\/script>/g, "");
 check("mobile dom rendered", dom.length > 2000, `len=${dom.length}`);
 const c = (re) => (dom.match(re) || []).length;
 check("form present", /<form id="f"/.test(dom));

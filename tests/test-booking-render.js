@@ -30,7 +30,7 @@ if (raw.length <= 2000) {
 
 // --dump-dom keeps the inline script's text, so every assertion below would
 // otherwise match the source instead of what the browser actually rendered
-const dom = raw.replace(/<script>[\s\S]*?<\/script>/g, "<script></scr" + "ipt>");
+const dom = raw.replace(/<script[^>]*>[\s\S]*?<\/script>/g, "<script></scr" + "ipt>");
 check("inline script stripped before asserting", dom.length < raw.length,
   `${raw.length} -> ${dom.length}`);
 

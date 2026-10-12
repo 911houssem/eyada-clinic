@@ -77,9 +77,9 @@ const uniq = () => Math.random().toString(36).slice(2, 8);
   check("an unknown slug never builds a live api url", !unknownInCode || bad.body.includes("D.slug"));
 
   // the page must not ship a syntax error: run its inline script through node
-  const scripts = page.body.match(/<script>([\s\S]*?)<\/script>/g) || [];
+  const scripts = page.body.match(/<script[^>]*>([\s\S]*?)<\/script>/g) || [];
   check("page has one inline script", scripts.length === 1, `n=${scripts.length}`);
-  const code = scripts[0].replace(/^<script>/, "").replace(/<\/script>$/, "");
+  const code = scripts[0].replace(/^<script[^>]*>/, "").replace(/<\/script>$/, "");
   // the template injects the data object; make it valid standalone js
   const runnable = code.replace(/const D = .*?;\n/, 'const D = { slug: "x", name: "y", daysAhead: 90 };\n');
   let parseErr = "";
