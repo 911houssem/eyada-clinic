@@ -204,6 +204,14 @@ async function waitHealthy(tries = 60) {
   const types = new Set(trashAll.json.items.map((t) => t.type));
   check("trash spans multiple entity types", types.has("services") && types.has("tasks") && types.has("appointments"));
 
+  // records carry clinicId: trashed ones must be visible + restorable (regression)
+  const rec = await req("POST", "/api/records", { token: A, body: { patientId: pid, chiefComplaint: "صداع", diagnosis: "توتر" } });
+  const delRec = await req("DELETE", "/api/records", { token: A, body: { id: rec.json.id } });
+  const trashRec = await req("GET", "/api/trash?type=records", { token: A });
+  check("trashed record is visible in trash", delRec.status === 200 && (trashRec.json.items || []).some((t) => t.id === rec.json.id));
+  const restRec = await req("POST", `/api/trash/records/${rec.json.id}/restore`, { token: A });
+  check("trashed record restores", restRec.status === 200, `code=${restRec.status}`);
+
   /* ═════════════ 3. PASSWORD RESET ═════════════ */
   const reg = await req("POST", "/api/auth/register", {
     body: { username: "resetuser", password: "Reset-Secret-2026", fullName: "مستخدم الاختبار", clinicName: "عيادة الاستعادة" },

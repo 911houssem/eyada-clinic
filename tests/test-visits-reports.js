@@ -120,10 +120,23 @@ const cookieOf = (r) => (r.headers?.["set-cookie"] || []).map((c) => c.split(";"
   // ── reports ──
   const inv = await req("POST", "/api/invoices", { cookie: A, body: { patientId: pid, subtotal: 200, total: 230, paidAmount: 100, paymentMethod: "cash" } });
   check("invoice created", inv.status === 200, `code=${inv.status}`);
+  // attribution: invoice linked to the doctor + a real service line
+  const svcList = await req("GET", "/api/services", { cookie: A });
+  const svcArr = Array.isArray(svcList.json) ? svcList.json : [];
+  const inv2 = await req("POST", "/api/invoices", { cookie: A, body: { patientId: pid, subtotal: 100, total: 100, paidAmount: 100,
+    doctorId: doc?.id, items: svcArr.length ? [{ name: svcArr[0].name, price: 100, serviceId: svcArr[0].id }] : [{ name: "x", price: 100 }] } });
+  check("invoice with doctor+service accepted", inv2.status === 200, `code=${inv2.status}`);
+  const badDoc = await req("POST", "/api/invoices", { cookie: A, body: { patientId: pid, subtotal: 10, total: 10, doctorId: "user_nope" } });
+  check("unknown doctor rejected (400)", badDoc.status === 400, `code=${badDoc.status}`);
   const rev = await req("GET", "/api/reports/revenue", { cookie: A });
   check("revenue totals from live data", rev.status === 200 && rev.json?.total >= 230 && rev.json?.paid >= 100 && rev.json?.due >= 130,
     `total=${rev.json?.total} paid=${rev.json?.paid} due=${rev.json?.due}`);
   check("revenue grouped by method", rev.json?.byMethod?.cash?.total >= 230);
+  const docName = doc?.fullName || doc?.username || "";
+  check("revenue grouped by doctor", doc && rev.json?.byDoctor?.[docName]?.total >= 100, docName);
+  check("revenue grouped by service", svcArr.length > 0 && rev.json?.byService?.[svcArr[0].name]?.amount >= 100, svcArr[0]?.name);
+  const revDocCsv = await req("GET", "/api/reports/revenue.csv?by=doctor", { cookie: A });
+  check("revenue by-doctor CSV served", revDocCsv.status === 200 && revDocCsv.text.includes("doctor"));
   const revCsv = await req("GET", "/api/reports/revenue.csv", { cookie: A });
   check("revenue CSV served", revCsv.status === 200 && (revCsv.headers["content-type"] || "").includes("text/csv") && revCsv.text.includes("day"), `code=${revCsv.status}`);
   const ap = await req("GET", "/api/reports/appointments", { cookie: A });

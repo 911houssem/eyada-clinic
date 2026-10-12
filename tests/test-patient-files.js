@@ -6,6 +6,7 @@
  * are covered too). Prints "PASS n   FAIL n".
  */
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const http = require("http");
 const fs = require("fs");
 const os = require("os");
@@ -71,7 +72,7 @@ const filesOnDisk = () => {
 (async () => {
   const srv = spawn(process.execPath, ["server.js"], {
     cwd: APP_DIR,
-    env: { ...process.env, DATA_DIR: TMP, PORT: String(PORT), HOST: "127.0.0.1", ENCRYPTION_KEY: ENC_KEY, FILE_MAX_BYTES: "300" },
+    env: { ...process.env, DATA_DIR: TMP, PORT: String(PORT), HOST: "127.0.0.1", ENCRYPTION_KEY: ENC_KEY, FILE_MAX_BYTES: "200000" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let srvOut = "";
@@ -104,11 +105,20 @@ const filesOnDisk = () => {
   check("exe mime rejected (400)", exeMime.status === 400, `code=${exeMime.status}`);
   const exeMagic = await req("POST", base, { cookie: A, body: { filename: "fake.pdf", mime: "application/pdf", data: b64(EXE) } });
   check("magic mismatch rejected (400)", exeMagic.status === 400, `code=${exeMagic.status}`);
-  const big = await req("POST", base, { cookie: A, body: { filename: "big.pdf", mime: "application/pdf", data: b64(Buffer.concat([Buffer.from("%PDF-1.4\n"), Buffer.alloc(500, 0x41)])) } });
-  check("oversize rejected (413, cap=300B)", big.status === 413, `code=${big.status}`);
+  const big = await req("POST", base, { cookie: A, body: { filename: "big.pdf", mime: "application/pdf", data: b64(Buffer.concat([Buffer.from("%PDF-1.4\n"), Buffer.alloc(300 * 1024, 0x41)])) } });
+  check("oversize rejected (413, cap=200000B)", big.status === 413, `code=${big.status}`);
+  // 100KB real file: base64 is ~137KB — must survive the input layer intact
+  // (regression: the old 20k per-string cap silently truncated such uploads)
+  const large = Buffer.concat([Buffer.from("%PDF-1.4\n"), crypto.randomBytes(100 * 1024)]);
+  const upLarge = await req("POST", base, { cookie: A, body: { filename: "large.pdf", mime: "application/pdf", data: b64(large) } });
+  check("100KB file uploads", upLarge.status === 200, `code=${upLarge.status}`);
+  const dlLarge = upLarge.json?.id
+    ? await req("GET", `${base}/${upLarge.json.id}/download`, { cookie: A })
+    : { status: 0, buf: Buffer.alloc(0) };
+  check("100KB file round-trips byte-identical", dlLarge.status === 200 && dlLarge.buf.equals(large), `code=${dlLarge.status} bytes=${dlLarge.buf.length}`);
 
   const list = await req("GET", base, { cookie: A });
-  check("list shows the two files", list.status === 200 && (list.json || []).length === 2, `n=${(list.json || []).length}`);
+  check("list shows the three files", list.status === 200 && (list.json || []).length === 3, `n=${(list.json || []).length}`);
 
   const dl = await req("GET", `${base}/${fid}/download`, { cookie: A });
   check("download 200 with pdf bytes", dl.status === 200 && dl.buf.equals(PDF), `code=${dl.status} bytes=${dl.buf.length}`);
@@ -120,7 +130,9 @@ const filesOnDisk = () => {
   const rawDb = fs.readFileSync(path.join(TMP, "db.json"), "utf8");
   check("original filename sealed in db.json", !rawDb.includes("ashia-sadr.pdf"));
   const disk = filesOnDisk();
-  check("stored under a random name", disk.length === 2 && !disk.some((f) => f.includes("ashia")), disk.join(","));
+  check("stored under a random name", disk.length === 3 && !disk.some((f) => f.includes("ashia")), disk.join(","));
+  const diskBytes = fs.readFileSync(path.join(TMP, "files", disk.find((f) => f.endsWith(".pdf"))));
+  check("file bytes sealed at rest (ENCRYPTION_KEY on)", diskBytes.slice(0, 9).toString() === "encbak:v1" && !diskBytes.includes(Buffer.from("%PDF-1.4")));
 
   // ── IDOR: clinic B ──
   const reg = await req("POST", "/api/auth/register", { body: { username: "fileb", password: "File-B-2026!", fullName: "B Owner", clinicName: "Clinic B Files" } });
@@ -144,9 +156,11 @@ const filesOnDisk = () => {
   await req("DELETE", `${base}/${fid}`, { cookie: A });
   const purge = await req("DELETE", `/api/trash/patientFiles/${fid}`, { cookie: A });
   check("permanent purge (200)", purge.status === 200, `code=${purge.status}`);
-  check("purge removed the bytes from disk", !filesOnDisk().some((f) => {
+  const left = filesOnDisk();
+  const purgedBytesGone = !left.some((f) => {
     try { return fs.readFileSync(path.join(TMP, "files", f)).equals(PDF); } catch { return false; }
-  }) && filesOnDisk().length === 1, filesOnDisk().join(","));
+  });
+  check("purge removed the target bytes, others intact", purgedBytesGone && left.length === 2, left.join(","));
 
   finish(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

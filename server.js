@@ -52,6 +52,7 @@ const RESTORE_FILE = argOf("restore");
 const VERIFY_BACKUP = argv.includes("--verify-backup");
 const ROTATE_KEY = argv.includes("--rotate-key");
 const ROTATE_SESSIONS = argv.includes("--rotate-sessions");
+const VERIFY_AUDIT = argv.includes("--verify-audit");
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || argOf("port") || 3000);
@@ -136,6 +137,10 @@ function audit(req, action, meta = {}) {
     };
     if (meta.detail) entry.detail = redact(meta.detail);
     if (meta.status) entry.status = meta.status;
+    // tamper-evident chain: each line commits to the previous line's hash
+    entry.prev = auditLast;
+    entry.h = sha256hex(`${auditLast}|${JSON.stringify(entry)}`);
+    auditLast = entry.h;
     fs.mkdirSync(DATA_DIR, { recursive: true });
     if (fs.existsSync(AUDIT_FILE) && fs.statSync(AUDIT_FILE).size > AUDIT_MAX_BYTES)
       fs.renameSync(AUDIT_FILE, AUDIT_FILE + ".1");
@@ -144,6 +149,43 @@ function audit(req, action, meta = {}) {
   } catch {
     /* auditing must never break a request */
   }
+}
+
+/** Hash chain head, recovered from the log tail at boot. */
+let auditLast = "GENESIS";
+function sha256hex(v) { return crypto.createHash("sha256").update(String(v)).digest("hex"); }
+function initAuditChain() {
+  try {
+    if (!fs.existsSync(AUDIT_FILE)) { auditLast = "GENESIS"; return; }
+    const lines = fs.readFileSync(AUDIT_FILE, "utf8").split("\n").filter((l) => l.trim());
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const e = JSON.parse(lines[i]);
+        if (e && typeof e.h === "string" && e.h) { auditLast = e.h; return; }
+      } catch { /* skip corrupt tail lines */ }
+    }
+    auditLast = "GENESIS";
+  } catch { auditLast = "GENESIS"; }
+}
+
+/** `--verify-audit`: recompute the chain; legacy (pre-chain) lines are counted
+ * and skipped, any broken link fails. Returns true when intact. */
+function verifyAuditCli() {
+  if (!fs.existsSync(AUDIT_FILE)) { log("no audit log yet"); return true; }
+  const lines = fs.readFileSync(AUDIT_FILE, "utf8").split("\n").filter((l) => l.trim());
+  let want = null, verified = 0, legacy = 0;
+  for (let i = 0; i < lines.length; i++) {
+    let e;
+    try { e = JSON.parse(lines[i]); } catch { fail(`audit line ${i + 1}: not JSON`); return false; }
+    if (!e || typeof e.h !== "string") { legacy++; want = null; continue; } // pre-chain line: restart
+    const { h, ...body } = e;
+    const prevOk = want === null || e.prev === want;
+    const selfOk = sha256hex(`${e.prev}|${JSON.stringify(body)}`) === h;
+    if (!prevOk || !selfOk) { fail(`audit chain broken at line ${i + 1}`); return false; }
+    want = h; verified++;
+  }
+  log(`audit chain OK: ${verified} chained, ${legacy} legacy (pre-chain) lines`);
+  return true;
 }
 
 /* ── Automatic backups (data/backups) ──
@@ -218,13 +260,29 @@ async function rotateKeyCli() {
     fail(`--rotate-key refused: ${stuck.length} sealed value(s) do not open with ENCRYPTION_KEY (e.g. ${stuck[0]}). Wrong current key?`);
     return false;
   }
+  // sealed file bytes must move too — open them all with the current keys first
+  const stuckFiles = [];
+  const movedFiles = [];
+  for (const f of db.patientFiles || []) {
+    if (!f.encrypted) continue;
+    let raw;
+    try { raw = fs.readFileSync(patientFilePath(f)); }
+    catch { stuckFiles.push(`${f.id}:missing-bytes`); continue; }
+    try { movedFiles.push([f, openFileBytes(raw)]); }
+    catch { stuckFiles.push(f.id); }
+  }
+  if (stuckFiles.length) {
+    fail(`--rotate-key refused: ${stuckFiles.length} sealed file(s) do not open with ENCRYPTION_KEY (e.g. ${stuckFiles[0]}). Wrong current key?`);
+    return false;
+  }
   if (!db.meta || typeof db.meta !== "object") db.meta = {};
   db.meta.encSalt = crypto.randomBytes(16).toString("hex"); // fresh salt: retired key material is useless now
   encKey = deriveFieldKey(nxt, db.meta.encSalt);
   encKeyLegacy = null; // the retired key must not open anything anymore
   mapSensitive(db, sealValue); // memory holds plaintext -> seal everything with the new key
+  for (const [f, plain] of movedFiles) fs.writeFileSync(patientFilePath(f), backupLib.encryptBuffer(plain, encKey));
   await flush();
-  log("--rotate-key done: every sealed field is now under NEW_ENCRYPTION_KEY.");
+  log(`--rotate-key done: every sealed field${movedFiles.length ? ` + ${movedFiles.length} file(s)` : ""} is now under NEW_ENCRYPTION_KEY.`);
   log("Next: set ENCRYPTION_KEY to the new secret, restart, and take a fresh backup.");
   return true;
 }
@@ -596,13 +654,15 @@ function readBody(req) {
 }
 
 /* ── Input sanitisation (single layer) ──
- * Defence in depth ONLY: strips C0 control chars (except tab/LF/CR) and caps
- * every string, in the one funnel every JSON body passes through. Output
+ * Defence in depth ONLY: strips C0 control chars (except tab/LF/CR) and drops
+ * proto-pollution keys, in the one funnel every JSON body passes through. The
+ * per-string cap tracks the body cap (base64 file uploads are legitimately
+ * megabytes — truncating them would corrupt uploads, so the 5MB body limit
+ * is the real bound; handlers slice their own fields further). Output
  * escaping (esc() in the booking page, JSON content-types on the API) remains
- * the real XSS boundary — this just keeps junk (null bytes, bell chars,
- * megabyte strings, proto keys) out of the database and the logs.
+ * the real XSS boundary.
  */
-const INPUT_STRING_MAX = 20_000;
+const INPUT_STRING_MAX = LIMITS.bodyBytes;
 const INPUT_CONTROL_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
 function sanitizeInput(v, depth = 0) {
   if (typeof v === "string") {
@@ -957,6 +1017,13 @@ const SAFE_SLUG = /^[a-z0-9][a-z0-9-]*$/;
     if (p.phone && !p.phoneIdx) { p.phoneIdx = phoneIndex(p.phone); idxFilled++; }
   }
   if (idxFilled) notes.push(`filled ${idxFilled} missing phoneIdx value(s)`);
+  // records created before they carried clinicId (trash scoping needs it)
+  const patClinic = new Map(db.patients.map((pt) => [pt.id, pt.clinicId]));
+  let rxClinics = 0;
+  for (const r of db.records) {
+    if (!r.clinicId && r.patientId && patClinic.get(r.patientId)) { r.clinicId = patClinic.get(r.patientId); rxClinics++; }
+  }
+  if (rxClinics) notes.push(`backfilled clinicId on ${rxClinics} record(s)`);
 
   // every account needs an explicit role and a permission grant
   for (const u of db.users) {
@@ -1000,6 +1067,7 @@ const SAFE_SLUG = /^[a-z0-9][a-z0-9-]*$/;
 function load() {
   loadSessions();
   loadResets();
+  initAuditChain();
   try {
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, "utf8");
@@ -2534,7 +2602,7 @@ route("GET", "/api/trash", async (req, res, p, url) => {
         type: slug, id: row.id, clinicId: row.clinicId,
         label: def.label, deletedAt: row.deletedAt || null,
         deletedBy: row.deletedBy || null, deletedByName: row.deletedByName || "",
-        summary: row.fullName || row.title || row.name || row.id,
+        summary: row.fullName || row.title || row.name || row.filename || row.diagnosis || row.id,
       });
     }
   }
@@ -2986,6 +3054,7 @@ route("POST", "/api/patients", async (req, res) => {
   if (b.consent === true) { patient.consentAt = now(); patient.consentVersion = CONSENT_VERSION; }
   db.patients.push(patient);
   save();
+  audit(req, "patient.create", { detail: patient.id });
   json(res, 200, patient);
 });
 
@@ -2998,6 +3067,7 @@ route("PUT", "/api/patients", async (req, res) => {
   if (b.phone !== undefined) patient.phoneIdx = phoneIndex(patient.phone); // keep the blind index with the number
   if (b.consent === true) { patient.consentAt = now(); patient.consentVersion = CONSENT_VERSION; }
   save();
+  audit(req, "patient.update", { detail: patient.id });
   json(res, 200, patient);
 });
 
@@ -3173,6 +3243,15 @@ function patientFilePath(row) {
   return path.join(FILES_DIR, path.basename(row.storedName || ""));
 }
 
+/** Open sealed file bytes (current key, then legacy). Throws when unreadable. */
+function openFileBytes(raw) {
+  for (const k of [encKey, encKeyLegacy]) {
+    if (!k) continue;
+    try { return backupLib.decryptBuffer(raw, k); } catch { /* try the next key */ }
+  }
+  throw new Error("cannot open file bytes with available keys");
+}
+
 function deletePatientFileBytes(row) {
   try {
     const p = patientFilePath(row);
@@ -3206,12 +3285,16 @@ route("POST", "/api/patients/:id/files", async (req, res, p) => {
   fs.mkdirSync(FILES_DIR, { recursive: true, mode: 0o700 });
   const storedName = `f_${crypto.randomBytes(16).toString("hex")}${FILE_TYPES[kind].ext}`;
   const dest = path.join(FILES_DIR, storedName);
-  fs.writeFileSync(dest, buf, { mode: 0o600 });
+  // bytes sealed with the field key when encryption is on (same AES-256-GCM
+  // framing as backups); plaintext otherwise. Old plaintext files keep working.
+  const sealed = !!encKey;
+  fs.writeFileSync(dest, sealed ? backupLib.encryptBuffer(buf, encKey) : buf, { mode: 0o600 });
   if (IS_PROD) chmodSafe(dest, 0o600);
   const row = {
     id: uid("pfile"), clinicId: patient.clinicId, patientId: patient.id,
     filename, storedName, mime: FILE_TYPES[kind].mime, size: buf.length,
     sha256: crypto.createHash("sha256").update(buf).digest("hex"),
+    encrypted: sealed,
     uploadedBy: s.user.id, createdAt: now(),
   };
   db.patientFiles.push(row);
@@ -3236,8 +3319,10 @@ route("GET", "/api/patients/:id/files/:fileId/download", async (req, res, p) => 
   const row = db.patientFiles.find((f) => f.id === p.fileId && f.patientId === patient.id && isLive(f));
   if (!row) throw notFound("الملف غير موجود");
   let bytes;
-  try { bytes = fs.readFileSync(patientFilePath(row)); }
-  catch { throw notFound("الملف غير موجود على القرص"); }
+  try {
+    const raw = fs.readFileSync(patientFilePath(row));
+    bytes = row.encrypted ? openFileBytes(raw) : raw;
+  } catch { throw notFound("الملف غير موجود على القرص"); }
   audit(req, "file.download", { detail: `${patient.id}:${row.id}` });
   res.writeHead(200, {
     "Content-Type": row.mime,
@@ -3443,6 +3528,31 @@ route("GET", "/api/invoices", async (req, res, p, url) => {
   json(res, 200, { invoices: list.map(decorateInvoice) });
 });
 
+/** Invoice line items: validated, normalised, optionally linked to a service. */
+function cleanInvoiceItems(items, clinicId) {
+  if (items === undefined) return undefined;
+  if (!Array.isArray(items)) throw badRequest("بنود الفاتورة غير صالحة");
+  if (items.length > 100) throw badRequest("عدد البنود كبير جداً");
+  return items.map((it) => {
+    const name = String((it && it.name) || (it && it.description) || "").trim().slice(0, 120);
+    if (!name) throw badRequest("اسم البند مطلوب لكل سطر");
+    let serviceId = "";
+    if (it && it.serviceId) {
+      const svc = db.services.find((x) => x.id === it.serviceId && x.clinicId === clinicId);
+      if (!svc) throw badRequest("خدمة غير موجودة في هذه العيادة");
+      serviceId = svc.id;
+    }
+    return { name, price: Math.max(0, num(it && (it.price ?? it.amount))), qty: Math.max(1, Math.floor(num(it && (it.qty ?? it.quantity), 1))), serviceId };
+  });
+}
+
+function assertClinicDoctor(clinicId, doctorId) {
+  if (!doctorId) return "";
+  if (!db.users.some((u) => u.id === doctorId && u.clinicId === clinicId))
+    throw badRequest("الطبيب المحدد غير موجود في هذه العيادة");
+  return doctorId;
+}
+
 route("POST", "/api/invoices", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
@@ -3451,14 +3561,16 @@ route("POST", "/api/invoices", async (req, res) => {
   const taxAmount = num(b.taxAmount, (subtotal * taxPercentage) / 100);
   const total = num(b.total, subtotal + taxAmount);
   const paidAmount = num(b.paidAmount);
+  const clinicId = resolveWriteClinic(s.user, b.clinicId);
 
   const invoice = {
-    id: uid("inv"), clinicId: resolveWriteClinic(s.user, b.clinicId), patientId: b.patientId || "",
+    id: uid("inv"), clinicId, patientId: b.patientId || "",
+    doctorId: assertClinicDoctor(clinicId, b.doctorId),
     subtotal, insuranceDiscount: num(b.insuranceDiscount), taxPercentage, taxAmount, total,
     paidAmount, dueAmount: total - paidAmount,
     status: b.status || (total - paidAmount > 0 ? "pending" : "paid"),
     paymentMethod: b.paymentMethod || "cash",
-    items: Array.isArray(b.items) ? b.items : [], createdAt: now(),
+    items: cleanInvoiceItems(b.items, clinicId) || [], createdAt: now(),
   };
   db.invoices.push(invoice);
   save();
@@ -3470,8 +3582,10 @@ route("PUT", "/api/invoices", async (req, res) => {
   const b = await readBody(req);
   const invoice = db.invoices.find((i) => i.id === b.id);
   assertRecordClinic(s.user, invoice, "الفاتورة");
-  for (const k of ["paidAmount", "status", "paymentMethod", "items"])
+  for (const k of ["paidAmount", "status", "paymentMethod"])
     if (b[k] !== undefined) invoice[k] = b[k];
+  if (b.doctorId !== undefined) invoice.doctorId = assertClinicDoctor(invoice.clinicId, b.doctorId);
+  if (b.items !== undefined) invoice.items = cleanInvoiceItems(b.items, invoice.clinicId);
   if (b.paidAmount !== undefined) {
     invoice.dueAmount = num(invoice.total) - num(invoice.paidAmount);
     invoice.status = invoice.dueAmount <= 0 ? "paid" : invoice.paidAmount > 0 ? "partial" : "pending";
@@ -3530,21 +3644,29 @@ function sendCsv(res, name, header, rows) {
 function revenueReport(clinicId, fromMs, toMs) {
   const rows = db.invoices.filter((i) => i.clinicId === clinicId && isLive(i) &&
     (Date.parse(i.createdAt) || 0) >= fromMs && (Date.parse(i.createdAt) || 0) <= toMs);
-  const total = { invoices: rows.length, total: 0, paid: 0, due: 0, byMethod: {}, byDay: {} };
+  const total = { invoices: rows.length, total: 0, paid: 0, due: 0, byMethod: {}, byDay: {}, byDoctor: {}, byService: {} };
+  const bump = (bucket, key, i) => {
+    bucket[key] = bucket[key] || { invoices: 0, total: 0, paid: 0, due: 0 };
+    bucket[key].invoices++;
+    bucket[key].total += num(i.total);
+    bucket[key].paid += num(i.paidAmount);
+    bucket[key].due += num(i.dueAmount);
+  };
   for (const i of rows) {
     total.total += num(i.total); total.paid += num(i.paidAmount); total.due += num(i.dueAmount);
-    const m = i.paymentMethod || "cash";
-    total.byMethod[m] = total.byMethod[m] || { invoices: 0, total: 0, paid: 0, due: 0 };
-    total.byMethod[m].invoices++;
-    total.byMethod[m].total += num(i.total);
-    total.byMethod[m].paid += num(i.paidAmount);
-    total.byMethod[m].due += num(i.dueAmount);
-    const day = String(i.createdAt || "").slice(0, 10);
-    total.byDay[day] = total.byDay[day] || { invoices: 0, total: 0, paid: 0, due: 0 };
-    total.byDay[day].invoices++;
-    total.byDay[day].total += num(i.total);
-    total.byDay[day].paid += num(i.paidAmount);
-    total.byDay[day].due += num(i.dueAmount);
+    bump(total.byMethod, i.paymentMethod || "cash", i);
+    bump(total.byDay, String(i.createdAt || "").slice(0, 10), i);
+    const doc = db.users.find((x) => x.id === i.doctorId);
+    bump(total.byDoctor, doc ? (doc.fullName || doc.username) : "بدون طبيب", i);
+    const items = Array.isArray(i.items) && i.items.length ? i.items : [{ name: "", price: i.total, serviceId: "" }];
+    for (const it of items) {
+      const svc = it.serviceId && db.services.find((x) => x.id === it.serviceId);
+      const label = svc ? svc.name : "بنود بدون خدمة";
+      const share = it.price != null ? num(it.price) * Math.max(1, Math.floor(num(it.qty, 1))) : 0;
+      const b = total.byService[label] || (total.byService[label] = { lines: 0, amount: 0 });
+      b.lines++;
+      b.amount += share;
+    }
   }
   return total;
 }
@@ -3600,6 +3722,15 @@ route("GET", "/api/reports/revenue.csv", async (req, res, p, url) => {
   if (!clinicId) throw badRequest("لا توجد عيادة");
   const { fromMs, toMs } = reportRange(url);
   const r = revenueReport(clinicId, fromMs, toMs);
+  const by = (url.searchParams.get("by") || "day").toLowerCase();
+  if (by === "doctor") {
+    const rows = Object.entries(r.byDoctor).map(([name, v]) => [name, v.invoices, v.total, v.paid, v.due]);
+    return sendCsv(res, "revenue-by-doctor.csv", ["doctor", "invoices", "total", "paid", "due"], rows);
+  }
+  if (by === "service") {
+    const rows = Object.entries(r.byService).map(([name, v]) => [name, v.lines, v.amount]);
+    return sendCsv(res, "revenue-by-service.csv", ["service", "lines", "amount"], rows);
+  }
   const rows = Object.entries(r.byDay).sort().map(([day, v]) => [day, v.invoices, v.total, v.paid, v.due]);
   sendCsv(res, "revenue.csv", ["day", "invoices", "total", "paid", "due"], rows);
 });
@@ -3999,9 +4130,9 @@ route("POST", "/api/records", async (req, res) => {
   const s = requireSession(req);
   const b = await readBody(req);
   if (!b.patientId) throw badRequest("المريض مطلوب");
-  ownedPatient(s.user, b.patientId);
+  const owner = ownedPatient(s.user, b.patientId);
   const record = {
-    id: uid("rec"), patientId: b.patientId, doctorId: b.doctorId || s.user.id,
+    id: uid("rec"), clinicId: owner.clinicId, patientId: b.patientId, doctorId: b.doctorId || s.user.id,
     chiefComplaint: b.chiefComplaint || "", diagnosis: b.diagnosis || "",
     treatment: b.treatment || "", notes: b.notes || "", createdAt: now(),
   };
@@ -5576,6 +5707,8 @@ if (RESTORE_FILE) {
   } catch (e) { fail("could not clear sessions:", e.message); process.exit(1); }
   log(`--rotate-sessions: revoked ${n} session(s). All users must sign in again.`);
   process.exit(0);
+} else if (VERIFY_AUDIT) {
+  process.exit(verifyAuditCli() ? 0 : 1);
 } else {
   startupChecks();
   load();
