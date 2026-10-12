@@ -4770,13 +4770,16 @@ route("DELETE", "/api/offers/:id", async (req, res, p) => {
 /* The public day grid runs exactly like the app's own one: 08:00 through 22:00. */
 const BOOKING_WINDOW = { openHour: 8, closeHour: 22, daysAhead: 90 };
 
-/** Tiny in-memory throttle so the public form can't be used to flood the db. */
+/** Tiny in-memory throttle so the public form can't be used to flood the db.
+ * Per-IP budget per 10 minutes; operators behind shared IPs can raise it via
+ * BOOKING_BURST_MAX (the generic per-minute rate limits still apply on top). */
+const BOOKING_BURST_MAX = Number(process.env.BOOKING_BURST_MAX || 8);
 const bookingHits = new Map();
 function throttleBooking(req) {
   const ip = req.socket.remoteAddress || "unknown";
   const cutoff = Date.now() - 10 * 60 * 1000;
   const list = (bookingHits.get(ip) || []).filter((t) => t > cutoff);
-  if (list.length >= 8) throw new AppError(429, "محاولات كثيرة جداً، حاول بعد قليل");
+  if (list.length >= BOOKING_BURST_MAX) throw new AppError(429, "محاولات كثيرة جداً، حاول بعد قليل");
   list.push(Date.now());
   bookingHits.set(ip, list);
   if (bookingHits.size > 5000) bookingHits.clear(); // keep the map bounded
@@ -4970,12 +4973,15 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
   // the sealed number itself is never compared.
   const wantIdx = phoneIndex(phone);
   const idxOf = (p) => (p && p.phoneIdx) || phoneIndex(p && p.phone);
+  // patient map first: O(A+P) instead of O(AxP) — matters on huge databases
+  const patById = new Map();
+  for (const p2 of db.patients) if (isLive(p2)) patById.set(p2.id, p2);
   const samePhoneDay = wantIdx !== "" && db.appointments.some((a) => {
     if (a.clinicId !== clinic.id) return false;
     if (!isLive(a)) return false;
     if (a.status === "cancelled" || a.status === "canceled") return false;
     if (!a.startTime || ymd(new Date(a.startTime)) !== date) return false;
-    const owner = db.patients.find((p2) => p2.id === a.patientId && isLive(p2));
+    const owner = patById.get(a.patientId);
     return !!owner && idxOf(owner) === wantIdx;
   });
   if (samePhoneDay)
