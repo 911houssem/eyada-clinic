@@ -2228,6 +2228,333 @@ route("DELETE", "/api/trash/:type/:id", async (req, res, p) => {
   json(res, 200, { success: true });
 });
 
+/* ── NOTIFICATIONS (config + queue + providers + reminders) ──
+ * Every outbound message goes through notifiers/ (console / whatsapp-cloud /
+ * webhook / smtp). Secrets are sealed at rest and never returned by the API.
+ * Delivery is asynchronous via db.notificationQueue with exponential backoff.
+ */
+
+const DEFAULT_NOTIFY = {
+  enabled: false,
+  channel: "console",
+  timezone: "Asia/Riyadh",
+  quietHours: { start: 22, end: 7 },
+  reminderOffsets: [24, 2],
+  templates: {
+    booking_confirmation: "تم تأكيد حجزك في {clinic} يوم {date} الساعة {time}.",
+    reminder_24h: "تذكير: موعدك في {clinic} غداً {date} الساعة {time}.",
+    reminder_2h: "تذكير: موعدك في {clinic} خلال ساعتين ({date} {time}).",
+    appointment_cancelled: "تم إلغاء موعدك في {clinic}.",
+  },
+};
+
+function defaultNotifyConfig() { return JSON.parse(JSON.stringify(DEFAULT_NOTIFY)); }
+function notifyConfig(clinicId) { return db.notificationConfigs.find((c) => c.clinicId === clinicId) || null; }
+function notifyConfigOr(clinicId) { return notifyConfig(clinicId) || { clinicId, ...defaultNotifyConfig() }; }
+
+/** Clinic id the caller may manage notifications for (owner/manager only callers). */
+function notifyScopeClinic(s, url) {
+  if (isSiteOwner(s.user)) {
+    const q = url && url.searchParams.get("clinicId");
+    return q || s.user.clinicId || (db.clinics[0] && db.clinics[0].id) || null;
+  }
+  return s.user.clinicId || (db.clinics[0] && db.clinics[0].id) || null;
+}
+
+/** Provider credentials never leave the server. */
+function publicNotifyConfig(clinicId) {
+  const row = notifyConfig(clinicId);
+  const base = row ? { ...row } : { clinicId, ...defaultNotifyConfig() };
+  delete base.whatsappToken; delete base.webhookSecret; delete base.smtpPassword;
+  base.whatsappTokenSet = !!(row && row.whatsappToken);
+  base.webhookSecretSet = !!(row && row.webhookSecret);
+  base.smtpPasswordSet = !!(row && row.smtpPassword);
+  return base;
+}
+
+function providerConfig(clinicId) {
+  const c = notifyConfig(clinicId) || {};
+  if ((c.channel || "console") === "whatsapp-cloud")
+    return { phoneNumberId: c.whatsappPhoneNumberId, accessToken: c.whatsappToken, language: c.language, templates: c.providerTemplates || {} };
+  if (c.channel === "webhook") return { url: c.webhookUrl, secret: c.webhookSecret };
+  return {};
+}
+
+const maskTo = (v) => { const s = String(v || ""); return s.length <= 4 ? "***" : "***" + s.slice(-4); };
+
+function enqueueNotification({ clinicId = null, channel = null, to = "", templateKey, vars = {}, at = null }) {
+  const job = {
+    id: uid("ntf"), clinicId, channel, to, templateKey, vars,
+    status: "pending", attempts: 0, createdAt: now(),
+    nextAttemptAt: at || now(), sentAt: null, lastError: "",
+  };
+  db.notificationQueue.push(job);
+  return job;
+}
+
+/** One delivery pass. Serialized so overlapping sweeps can't double-send. */
+let notifyRunning = false;
+async function processNotificationQueue() {
+  if (notifyRunning) return 0;
+  notifyRunning = true;
+  let sentCount = 0;
+  try {
+    const atMs = Date.now();
+    const cutoff = atMs - 60_000;
+    const perClinic = new Map();
+    for (const j of db.notificationQueue)
+      if (j.status === "sent" && j.sentAt && Date.parse(j.sentAt) > cutoff)
+        perClinic.set(j.clinicId, (perClinic.get(j.clinicId) || 0) + 1);
+
+    const due = db.notificationQueue
+      .filter((j) => j.status === "pending" && (Date.parse(j.nextAttemptAt) || 0) <= atMs)
+      .slice(0, 100);
+
+    let changed = false;
+    for (const job of due) {
+      const used = perClinic.get(job.clinicId) || 0;
+      if (used >= LIMITS.notifRatePerMin) break; // per-clinic ceiling: resume next sweep
+      const cfg = notifyConfigOr(job.clinicId);
+      const channel = job.channel || cfg.channel || "console";
+      const res = await notify.send({
+        channel, to: job.to, templateKey: job.templateKey, vars: job.vars,
+        clinicId: job.clinicId, config: providerConfig(job.clinicId),
+      });
+      job.attempts++;
+      if (res && res.ok) {
+        job.status = "sent"; job.sentAt = now(); job.lastError = "";
+        perClinic.set(job.clinicId, used + 1);
+        sentCount++;
+        // operational log: who/when/template only — no medical content, no secrets
+        db.notificationLog.push({
+          id: uid("nlog"), clinicId: job.clinicId, channel,
+          to: maskTo(job.to), templateKey: job.templateKey, sentAt: job.sentAt,
+        });
+      } else {
+        job.lastError = (res && res.reason) || "error";
+        if (job.attempts >= LIMITS.notifMaxAttempts) job.status = "failed";
+        else job.nextAttemptAt = new Date(atMs + Math.pow(2, job.attempts) * 60_000).toISOString();
+      }
+      changed = true;
+    }
+    if (changed) save();
+  } finally { notifyRunning = false; }
+  return sentCount;
+}
+
+function clinicDateParts(tz, ms) {
+  const d = new Date(ms);
+  try {
+    return {
+      date: new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(d),
+      time: new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(d),
+    };
+  } catch { return { date: d.toISOString().slice(0, 10), time: d.toISOString().slice(11, 16) }; }
+}
+
+function clinicHour(tz, ms) {
+  try { return Number(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hour12: false }).format(new Date(ms))); }
+  catch { return new Date(ms).getHours(); }
+}
+
+function inQuietHours(cfg, ms) {
+  const q = cfg.quietHours || {};
+  const start = num(q.start, 22); const end = num(q.end, 7);
+  if (start === end) return false;
+  const h = clinicHour(cfg.timezone || "Asia/Riyadh", ms);
+  return start < end ? (h >= start && h < end) : (h >= start || h < end);
+}
+
+const renderTemplate = (text, vars) =>
+  String(text || "").replace(/\{(\w+)\}/g, (_, k) => (vars && vars[k] != null ? String(vars[k]) : ""));
+
+/** Scan upcoming appointments and queue 24h/2h reminders exactly once each.
+ *  Markers persist on the appointment, so a restart never re-sends. */
+function sweepReminders(atMs = Date.now()) {
+  let queued = 0;
+  for (const clinic of db.clinics) {
+    const cfg = notifyConfig(clinic.id);
+    if (!cfg || !cfg.enabled) continue;
+    if (inQuietHours(cfg, atMs)) continue; // defer the whole clinic; next sweep retries
+    const offsets = Array.isArray(cfg.reminderOffsets) ? cfg.reminderOffsets : [24, 2];
+    for (const a of db.appointments) {
+      if (a.clinicId !== clinic.id || !isLive(a)) continue;
+      if (["cancelled", "canceled", "completed"].includes(String(a.status))) continue;
+      const startMs = Date.parse(a.startTime);
+      if (!Number.isFinite(startMs) || startMs <= atMs) continue;
+      a.reminders = a.reminders || {};
+      for (const h of offsets) {
+        const key = "h" + h;
+        if (a.reminders[key]) continue;
+        if (atMs < startMs - h * 3600_000) continue; // window not open yet
+        const patient = db.patients.find((p) => p.id === a.patientId && isLive(p));
+        const parts = clinicDateParts(cfg.timezone || "Asia/Riyadh", startMs);
+        const vars = { clinic: clinic.name, name: patient ? patient.fullName : "", date: parts.date, time: parts.time };
+        vars.message = renderTemplate((cfg.templates || {})["reminder_" + h + "h"] || "تذكير بموعدك", vars);
+        enqueueNotification({ clinicId: clinic.id, channel: cfg.channel, to: patient ? patient.phone : "", templateKey: "reminder_" + h + "h", vars });
+        a.reminders[key] = now();
+        queued++;
+      }
+    }
+  }
+  if (queued) save();
+  return queued;
+}
+
+/* ── NOTIFICATION ENDPOINTS ── */
+
+route("GET", "/api/notifications", async (req, res, p, url) => {
+  const s = requireClinicOwner(req);
+  const clinicId = notifyScopeClinic(s, url);
+  const queue = db.notificationQueue
+    .filter((j) => j.clinicId === clinicId)
+    .slice(-100).reverse()
+    .map((j) => ({
+      id: j.id, templateKey: j.templateKey, to: maskTo(j.to), channel: j.channel,
+      status: j.status, attempts: j.attempts, createdAt: j.createdAt,
+      sentAt: j.sentAt, lastError: redact(j.lastError),
+    }));
+  const log = db.notificationLog.filter((l) => l.clinicId === clinicId).slice(-100).reverse();
+  json(res, 200, { config: publicNotifyConfig(clinicId), queue, log });
+});
+
+route("PUT", "/api/notifications", async (req, res, p, url) => {
+  const s = requireClinicOwner(req);
+  const clinicId = notifyScopeClinic(s, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة مرتبطة بحسابك");
+  const b = await readBody(req);
+  const existing = notifyConfig(clinicId);
+  // mutate a copy so a rejected request can never poison the live config
+  const row = existing
+    ? { ...existing, quietHours: { ...(existing.quietHours || {}) }, templates: { ...(existing.templates || {}) } }
+    : { id: uid("ncfg"), clinicId, ...defaultNotifyConfig(), createdAt: now() };
+
+  if (b.enabled !== undefined) row.enabled = !!b.enabled;
+  if (b.channel !== undefined) {
+    const ch = String(b.channel);
+    if (ch !== "console" && !notify.has(ch)) throw badRequest("قناة غير مدعومة: " + ch);
+    row.channel = ch;
+  }
+  if (b.timezone !== undefined) row.timezone = String(b.timezone).slice(0, 60);
+  if (b.quietHours !== undefined && b.quietHours)
+    row.quietHours = { start: num(b.quietHours.start, 22), end: num(b.quietHours.end, 7) };
+  if (Array.isArray(b.reminderOffsets))
+    row.reminderOffsets = b.reminderOffsets.map((x) => Math.max(1, num(x))).filter(Boolean).slice(0, 6);
+  if (b.templates !== undefined && b.templates) row.templates = { ...(row.templates || {}), ...b.templates };
+  if (b.whatsappPhoneNumberId !== undefined) row.whatsappPhoneNumberId = String(b.whatsappPhoneNumberId);
+  if (b.whatsappLanguage !== undefined) row.language = String(b.whatsappLanguage);
+  if (b.webhookUrl !== undefined) row.webhookUrl = String(b.webhookUrl);
+  // secrets: overwrite only when a value is supplied; "" clears
+  if (b.whatsappToken !== undefined) row.whatsappToken = String(b.whatsappToken || "");
+  if (b.webhookSecret !== undefined) row.webhookSecret = String(b.webhookSecret || "");
+  if (b.smtpPassword !== undefined) row.smtpPassword = String(b.smtpPassword || "");
+
+  if (row.channel === "whatsapp-cloud" && (!row.whatsappToken || !row.whatsappPhoneNumberId))
+    throw badRequest("إعداد واتساب ناقص (رقم المرسل + التوكن)");
+  if (row.channel === "webhook" && !row.webhookUrl) throw badRequest("رابط الويبهوك مطلوب");
+
+  if (existing) Object.assign(existing, row);
+  else db.notificationConfigs.push(row);
+  save();
+  audit(req, "notifications.update", { detail: clinicId });
+  json(res, 200, { config: publicNotifyConfig(clinicId) });
+});
+
+route("POST", "/api/notifications/test", async (req, res, p, url) => {
+  const s = requireClinicOwner(req);
+  const clinicId = notifyScopeClinic(s, url);
+  const b = await readBody(req);
+  if (!b.to) throw badRequest("المستلم مطلوب");
+  const cfg = notifyConfigOr(clinicId);
+  enqueueNotification({ clinicId, channel: cfg.channel, to: b.to, templateKey: "test",
+    vars: { message: "رسالة اختبار من نظام عيادة" } });
+  const sent = await processNotificationQueue();
+  json(res, 200, { success: true, sent });
+});
+
+/* ── PUBLIC BOOKING MANAGE (cancel / reschedule via hashed token) ── */
+
+function manageAppointment(slug, token) {
+  const clinic = clinicBySlug(slug);
+  if (!clinic) throw notFound("العيادة غير موجودة");
+  if (!token) throw badRequest("رمز الإدارة مطلوب");
+  const h = sha256(String(token));
+  const appt = db.appointments.find((a) => a.manageTokenHash === h && a.clinicId === clinic.id && isLive(a));
+  if (!appt) throw notFound("رابط غير صالح أو منتهي");
+  const startMs = Date.parse(appt.startTime);
+  if (!Number.isFinite(startMs) || Date.now() > startMs) throw new AppError(410, "انتهت صلاحية إدارة هذا الحجز");
+  return { clinic, appt };
+}
+
+function appointmentPatientPhone(appt) {
+  const p = db.patients.find((x) => x.id === appt.patientId && isLive(x));
+  return p ? p.phone : "";
+}
+
+route("GET", "/api/public/booking/:slug/appointment", async (req, res, p, url) => {
+  const { clinic, appt } = manageAppointment(p.slug, url.searchParams.get("token"));
+  const parts = clinicDateParts(clinic.timezone || "Asia/Riyadh", Date.parse(appt.startTime));
+  json(res, 200, {
+    appointment: {
+      clinicName: clinic.name, date: parts.date, time: parts.time,
+      status: appt.status, serviceId: appt.serviceId || "", doctorId: appt.doctorId || "",
+    },
+    canCancel: !["cancelled", "canceled"].includes(String(appt.status)),
+  });
+});
+
+route("POST", "/api/public/booking/:slug/cancel", async (req, res, p) => {
+  throttleBooking(req);
+  const b = await readBody(req);
+  const { clinic, appt } = manageAppointment(p.slug, b.token);
+  if (["cancelled", "canceled"].includes(String(appt.status))) throw badRequest("الحجز ملغي بالفعل");
+  appt.status = "cancelled";
+  appt.cancelledAt = now();
+  appt.cancelledBy = "patient";
+  const cfg = notifyConfig(clinic.id);
+  if (cfg && cfg.enabled) {
+    const vars = { clinic: clinic.name };
+    vars.message = renderTemplate((cfg.templates || {}).appointment_cancelled || "تم إلغاء موعدك", vars);
+    enqueueNotification({ clinicId: clinic.id, channel: cfg.channel, to: appointmentPatientPhone(appt), templateKey: "appointment_cancelled", vars });
+  }
+  save();
+  audit(req, "booking.cancel", { detail: appt.id });
+  json(res, 200, { success: true });
+});
+
+route("POST", "/api/public/booking/:slug/reschedule", async (req, res, p) => {
+  throttleBooking(req);
+  const b = await readBody(req);
+  const { clinic, appt } = manageAppointment(p.slug, b.token);
+  if (["cancelled", "canceled"].includes(String(appt.status))) throw badRequest("لا يمكن تعديل حجز ملغي");
+  const date = String(b.date || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw badRequest("التاريخ غير صالح");
+
+  const svc = appt.serviceId ? db.services.find((x) => x.id === appt.serviceId && isLive(x)) : null;
+  const durationMin = svc ? serviceDuration(svc) : DEFAULT_APPTMENT_MIN;
+  const slots = bookingSlots(clinic, date, appt.doctorId, durationMin);
+  const chosen = slots.find((s) => s.available);
+  if (!chosen) throw new AppError(409, "لا توجد مواعيد متاحة في هذا اليوم — جرّب يوماً آخر");
+  const startMs = new Date(`${date}T${chosen.time}:00`).getTime();
+  if (appointmentClashes(clinic.id, appt.doctorId, startMs, startMs + durationMin * 60000, appt.id))
+    throw new AppError(409, "هذا الوقت لم يعد متاحاً — جرّب يوماً آخر");
+
+  appt.startTime = new Date(startMs).toISOString();
+  appt.endTime = new Date(startMs + durationMin * 60000).toISOString();
+  appt.status = "scheduled";
+  appt.reminders = {}; // let the 24h/2h reminders fire again for the new time
+  const cfg = notifyConfig(clinic.id);
+  const parts = clinicDateParts((cfg && cfg.timezone) || "Asia/Riyadh", startMs);
+  if (cfg && cfg.enabled) {
+    const vars = { clinic: clinic.name, name: appointmentPatientPhone(appt) ? "" : "", date: parts.date, time: parts.time };
+    vars.message = renderTemplate((cfg.templates || {}).booking_confirmation || "تم تعديل حجزك", vars);
+    enqueueNotification({ clinicId: clinic.id, channel: cfg.channel, to: appointmentPatientPhone(appt), templateKey: "booking_confirmation", vars });
+  }
+  save();
+  audit(req, "booking.reschedule", { detail: appt.id });
+  json(res, 200, { success: true, appointment: { date: parts.date, time: parts.time, clinicName: clinic.name } });
+});
+
 /* ── PATIENTS ── */
 
 route("GET", "/api/patients", async (req, res, p, url) => {
@@ -3477,6 +3804,7 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
   }
 
   const start = new Date(`${date}T${time}:00`);
+  const manageToken = crypto.randomBytes(32).toString("hex");
   const appt = {
     id: uid("apt"), clinicId: clinic.id, patientId: patient.id, doctorId,
     title: service ? service.name : "حجز عبر الموقع", type: "consultation",
@@ -3486,8 +3814,22 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
     endTime: new Date(start.getTime() + durationMin * 60000).toISOString(),
     status: "scheduled", notes: String(b.note || "").slice(0, 500),
     source: "booking", createdAt: now(),
+    // cancel/reschedule capability: only the holder of the raw token can act,
+    // and only up to the appointment time
+    manageTokenHash: sha256(manageToken),
+    manageTokenExpiresAt: start.toISOString(),
+    consentAt: b.consent === true ? now() : null,
   };
   db.appointments.push(appt);
+
+  // confirmation, only when the clinic opted into notifications
+  const ncfg = notifyConfig(clinic.id);
+  if (ncfg && ncfg.enabled) {
+    const parts = clinicDateParts(ncfg.timezone || "Asia/Riyadh", start.getTime());
+    const vars = { clinic: clinic.name, name, date: parts.date, time: parts.time };
+    vars.message = renderTemplate((ncfg.templates || {}).booking_confirmation || "تم تأكيد حجزك", vars);
+    enqueueNotification({ clinicId: clinic.id, channel: ncfg.channel, to: phone, templateKey: "booking_confirmation", vars });
+  }
   save();
 
   json(res, 200, {
@@ -3496,6 +3838,8 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
       id: appt.id, date, time, clinicName: clinic.name,
       serviceName: service ? service.name : "",
       durationMin, price: appt.price, currency: clinic.currency || "SAR",
+      manageToken,
+      manageUrl: `${publicBaseUrl()}/booking/${clinic.bookingSlug}?manage=${manageToken}`,
     },
     message: `تم استلام طلب الحجز بنجاح، ${name}.`,
   });
@@ -4004,6 +4348,14 @@ const sweeper = setInterval(() => {
   }
 }, LIMITS.sessionSweepMs);
 if (sweeper.unref) sweeper.unref();
+
+const queueTimer = setInterval(() => { processNotificationQueue().catch((e) => fail("queue worker error:", e.message)); }, LIMITS.queueSweepMs);
+if (queueTimer.unref) queueTimer.unref();
+
+const reminderTimer = setInterval(() => {
+  try { sweepReminders(); } catch (e) { fail("reminder sweep error:", e.message); }
+}, LIMITS.reminderSweepMs);
+if (reminderTimer.unref) reminderTimer.unref();
 
 const backupTimer = setInterval(() => runBackup("scheduled"), LIMITS.backupIntervalMs);
 if (backupTimer.unref) backupTimer.unref();

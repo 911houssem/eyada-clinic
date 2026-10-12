@@ -228,6 +228,10 @@ function buildBookingPage(opts) {
   .field label{display:flex;align-items:center;gap:7px;font-size:.85rem;font-weight:700;margin:0 0 8px}
   .field label b{color:var(--err)}
   .field label .opt{color:var(--muted);font-weight:500;font-size:.77rem}
+  .consent{display:flex;align-items:flex-start;gap:10px;margin-top:16px;font-size:.83rem;color:var(--muted);
+    background:var(--card-2);border:1px solid var(--line-2);border-radius:var(--r-s);padding:12px 14px;line-height:1.7;cursor:pointer}
+  .consent input{margin:3px 0 0;width:18px;height:18px;accent-color:var(--brand);flex:none}
+  .consent.bad{border-color:var(--err);background:var(--err-soft)}
   input,select,textarea{width:100%;padding:12px 14px;border-radius:12px;border:1.5px solid var(--line);
     background:var(--card-2);color:var(--fg);font:inherit;transition:border-color .16s,box-shadow .16s,background .16s}
   input:focus,select:focus,textarea:focus{outline:0;border-color:var(--brand);box-shadow:var(--ring);background:var(--card)}
@@ -782,6 +786,9 @@ function validate(showAll){
   if(nameEl){ nameEl.classList.toggle("bad", showAll && !nOk); var en=$("#ename"); if(en) en.textContent = (showAll && !nOk) ? "الاسم مطلوب (٣ أحرف على الأقل)" : ""; }
   if(phoneEl){ phoneEl.classList.toggle("bad", showAll && !pOk); var ep=$("#ephone"); if(ep) ep.textContent = (showAll && !pOk) ? "رقم جوال غير صالح" : ""; }
   var ok = nOk && pOk;
+  var cEl=$("#consent"), cWrap=$("#consentwrap");
+  if(cWrap) cWrap.classList.toggle("bad", showAll && cEl && !cEl.checked);
+  if(showAll && cEl && !cEl.checked) ok=false;
   if(showAll){ if(state.services.length && !state.serviceId) ok=false; if(!state.time) ok=false; }
   return ok;
 }
@@ -817,6 +824,7 @@ function render(){
             '<div class="field"><label for="phone">' + I.phone + ' رقم الجوال <b>*</b></label><input id="phone" inputmode="tel" autocomplete="tel" placeholder="05xxxxxxxx"><small class="err" id="ephone"></small></div>' +
           '</div>' +
           '<div class="field"><label for="note">' + I.info + ' ملاحظات للعيادة <span class="opt">اختياري</span></label><textarea id="note" rows="3" maxlength="500" placeholder="سبب الزيارة أو أي ملاحظة"></textarea></div>' +
+          '<label class="consent" id="consentwrap"><input type="checkbox" id="consent"><span>أوافق على استخدام اسمي ورقم جوالی لتأكيد الموعد والتواصل بشأنه فقط، ويمكنني طلب حذفها لاحقاً.</span></label>' +
         '</section>' +
       '</form>' +
       '<div class="msg" id="msg" role="status" aria-live="polite"></div>' +
@@ -832,6 +840,7 @@ function render(){
   d.addEventListener("change", function(){ paintDays(); loadSlots(); });
   $("#name").addEventListener("input", function(){ updateProgress(); validate(false); });
   $("#phone").addEventListener("input", function(){ updateProgress(); validate(false); });
+  var cEl=$("#consent"); if(cEl) cEl.addEventListener("change", function(){ updateProgress(); validate(false); });
   $("#f").addEventListener("submit", submit);
   updateProgress(); syncBars();
   return loadSlots();
@@ -847,6 +856,8 @@ function submit(ev){
   if(!validPhone(phone)) problems.push(phoneEl);
   if(state.services.length && !state.serviceId) problems.push({ svc:true });
   if(!state.time) problems.push({ slots:true });
+  var cEl=$("#consent");
+  if(cEl && !cEl.checked) problems.push({ consent:true });
   validate(true);
   if(problems.length){
     say("يرجى إكمال الحقول المطلوبة قبل التأكيد", "err");
@@ -854,6 +865,7 @@ function submit(ev){
     var first=problems[0];
     if(first && first.focus) first.focus();
     else if(first && first.svc){ var sv=$("#svcs"); if(sv) sv.scrollIntoView({behavior:"smooth",block:"center"}); }
+    else if(first && first.consent){ var cw=$("#consentwrap"); if(cw) cw.scrollIntoView({behavior:"smooth",block:"center"}); }
     else { var sl=$("#auto"); if(sl) sl.scrollIntoView({behavior:"smooth",block:"center"}); }
     updateProgress();
     return;
@@ -865,7 +877,7 @@ function submit(ev){
   fetch(API, {
     method:"POST",
     headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({ patientName:name, phone:phone, date:$("#date").value, doctorId:state.doctorId || "", serviceId:state.serviceId, note:$("#note").value })
+    body: JSON.stringify({ patientName:name, phone:phone, date:$("#date").value, doctorId:state.doctorId || "", serviceId:state.serviceId, note:$("#note").value, consent: !!($("#consent") && $("#consent").checked) })
   })
   .then(function(r){ return r.json().then(function(d){ return { ok:r.ok, status:r.status, d:d }; }); })
   .then(function(r){
@@ -933,12 +945,14 @@ function done(d){
         : '<p class="tip">سيتم تأكيد الموعد معك هاتفياً.</p>') +
       '<div class="actions">' +
         '<button type="button" class="act primary" id="icsbtn">' + I.ics + ' إضافة للتقويم</button>' +
+        (a.manageUrl ? '<button type="button" class="act" id="managebtn">' + I.clock + ' إدارة الحجز أو إلغاؤه</button>' : '') +
         '<button type="button" class="act" id="printbtn">' + I.print + ' طباعة</button>' +
         '<button type="button" class="act wide" id="againbtn">' + I.refresh + ' حجز موعد آخر</button>' +
       '</div>' +
     '</div>';
   var bar=$("#bottombar"); if(bar) bar.classList.remove("show");
   $("#againbtn").addEventListener("click", function(){ state.time=""; state.movedDay=false; render(); window.scrollTo({ top:0, behavior:"smooth" }); });
+  var mbtn=$("#managebtn"); if(mbtn) mbtn.addEventListener("click", function(){ location.href = a.manageUrl; });
   $("#printbtn").addEventListener("click", function(){ window.print(); });
   $("#icsbtn").addEventListener("click", function(){ downloadIcs(a); });
   $("#copybtn").addEventListener("click", function(){
@@ -977,6 +991,90 @@ function renderClosed(msg, until){
   var strip=$("#hstrip"); if(strip) strip.innerHTML="";
 }
 
+/* ── manage booking (cancel / reschedule via hashed token link) ── */
+function manageError(msg){
+  $("#wrap").classList.add("single");
+  $("#wrap").innerHTML =
+    '<div class="card off">' +
+      '<div class="seal"><span class="ring"></span><svg viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/></svg></div>' +
+      '<h1>تعذّر فتح الرابط</h1>' +
+      '<p class="muted">' + esc(msg || "رابط غير صالح أو منتهي الصلاحية.") + '</p>' +
+    '</div>';
+  var bar=$("#bottombar"); if(bar) bar.classList.remove("show");
+}
+function renderManage(token){
+  $("#wrap").classList.add("single");
+  $("#wrap").innerHTML = '<div class="card"><div class="empty">' + I.clock + ' جارٍ تحميل بيانات الحجز…</div></div>';
+  var bar=$("#bottombar"); if(bar) bar.classList.remove("show");
+  fetch(API + "/appointment?token=" + encodeURIComponent(token))
+    .then(function(r){ return r.json().then(function(d){ return { ok:r.ok, d:d }; }); })
+    .then(function(r){
+      if(!r.ok || !r.d || !r.d.appointment){ manageError(r.d && r.d.error); return; }
+      manageCard(r.d, token);
+    })
+    .catch(function(){ manageError("تعذّر الاتصال بالخادم، جرّب لاحقاً."); });
+}
+function manageCard(d, token){
+  var a=d.appointment || {};
+  var cancelled = String(a.status) === "cancelled" || String(a.status) === "canceled";
+  var rows =
+    row2("العيادة", esc(a.clinicName || state.clinic.name || "")) +
+    row2("اليوم", esc(a.date || "")) +
+    row2("الوقت", esc(a.time || "")) +
+    row2("الحالة", cancelled ? "ملغي" : "مؤكّد");
+  var body =
+    '<div class="card ticket" id="ticket">' +
+      '<div class="seal"><span class="ring"></span><svg viewBox="0 0 24 24"><path d="m5 12.5 4.4 4.4L19 7"/></svg></div>' +
+      '<h2>إدارة موعدك</h2>' +
+      '<p class="muted">يمكنك تأجيل الموعد أو إلغاؤه من هنا قبل موعده.</p>' +
+      '<div class="rows">' + rows + '</div>';
+  if(cancelled){
+    body += '<p class="tip">تم إلغاء هذا الموعد. يمكنك حجز موعد جديد من صفحة العيادة.</p>' +
+      '<div class="actions"><button type="button" class="act wide" id="mhome">' + I.refresh + ' حجز موعد جديد</button></div>';
+  } else if(d.canCancel === false){
+    body += '<p class="tip">لا يمكن تعديل هذا الموعد حالياً. يرجى التواصل مع العيادة.</p>';
+  } else {
+    body +=
+      '<div class="field" style="margin-top:18px"><label for="mdate">' + I.cal + ' تأجيل إلى يوم آخر</label>' +
+        '<input id="mdate" type="date" min="' + iso(new Date()) + '"></div>' +
+      '<div class="actions">' +
+        '<button type="button" class="act primary" id="mresched">' + I.refresh + ' تأجيل الموعد</button>' +
+        '<button type="button" class="act" id="mcancel">' + I.info + ' إلغاء الحجز</button>' +
+      '</div>';
+  }
+  body += '</div>';
+  $("#wrap").innerHTML = body;
+
+  var hm=$("#mhome"); if(hm) hm.addEventListener("click", function(){ state.time=""; render(); window.scrollTo({ top:0, behavior:"smooth" }); });
+  var rs=$("#mresched"); if(rs) rs.addEventListener("click", function(){ manageReschedule(token, rs); });
+  var cc=$("#mcancel"); if(cc) cc.addEventListener("click", function(){ manageCancel(token, cc); });
+}
+function manageCancel(token, btn){
+  if(btn){ btn.disabled=true; }
+  fetch(API + "/cancel", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ token:token }) })
+    .then(function(r){ return r.json().then(function(d){ return { ok:r.ok, d:d }; }); })
+    .then(function(r){
+      if(!r.ok){ toast((r.d && r.d.error) || "تعذّر إلغاء الحجز", "err"); if(btn) btn.disabled=false; return; }
+      toast("تم إلغاء الموعد", "ok");
+      renderManage(token);
+    })
+    .catch(function(){ toast("تعذّر الاتصال بالخادم", "err"); if(btn) btn.disabled=false; });
+}
+function manageReschedule(token, btn){
+  var de=$("#mdate");
+  var val=de ? de.value : "";
+  if(!val){ toast("اختر اليوم الجديد أولاً", "err"); if(de) de.focus(); return; }
+  if(btn){ btn.disabled=true; }
+  fetch(API + "/reschedule", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ token:token, date:val }) })
+    .then(function(r){ return r.json().then(function(d){ return { ok:r.ok, d:d }; }); })
+    .then(function(r){
+      if(!r.ok){ toast((r.d && r.d.error) || "تعذّر تأجيل الحجز", "err"); if(btn) btn.disabled=false; return; }
+      toast("تم تأجيل الموعد بنجاح", "ok");
+      renderManage(token);
+    })
+    .catch(function(){ toast("تعذّر الاتصال بالخادم", "err"); if(btn) btn.disabled=false; });
+}
+
 /* ── boot ── */
 function boot(){
   fetch(API)
@@ -998,6 +1096,9 @@ function boot(){
       $("#hmeta").innerHTML = meta.join("");
 
       if(d.closed){ renderClosed(d.closedMessage, d.closedUntil); return; }
+
+      var mtoken = new URLSearchParams(location.search).get("manage");
+      if(mtoken){ renderManage(mtoken); return; }
 
       var strip=[I.check + " تأكيد الموعد فوراً", I.clock + " مواعيد من ٨ صباحاً حتى ١٠ مساءً", I.shield + " بياناتك محفوظة"];
       $("#hstrip").innerHTML = strip.map(function(x){ return "<span>" + x + "</span>"; }).join("");
