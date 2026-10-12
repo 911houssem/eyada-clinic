@@ -638,8 +638,8 @@ function serviceCards(){
   var out='<div class="svcs">';
   for(var i=0;i<state.services.length;i++){
     var s=state.services[i], sel=(state.serviceId===s.id);
-    out += '<label class="svc' + (sel?' sel':'') + '" data-id="' + s.id + '">' +
-      '<input type="radio" name="svc" value="' + s.id + '"' + (sel?' checked':'') + '>' +
+    out += '<label class="svc' + (sel?' sel':'') + '" data-id="' + esc(s.id) + '">' +
+      '<input type="radio" name="svc" value="' + esc(s.id) + '"' + (sel?' checked':'') + '>' +
       '<div class="svc-top"><span class="svc-ic">' + I.clinic + '</span><span class="tick">' + I.check + '</span></div>' +
       '<span class="nm">' + esc(s.name) + '</span>' +
       (s.description ? '<span class="ds">' + esc(s.description) + '</span>' : '') +
@@ -691,7 +691,7 @@ function paintDocs(){
   var out='<button type="button" class="doc" data-id=""' + (!state.doctorId?' aria-pressed="true"':'') + '><span class="av">' + I.spark + '</span>أي طبيب متاح</button>';
   for(var i=0;i<state.doctors.length;i++){
     var d=state.doctors[i];
-    out += '<button type="button" class="doc" data-id="' + d.id + '"' + (state.doctorId===d.id?' aria-pressed="true"':'') + '><span class="av">' + esc(initial(d.fullName)) + '</span>' + esc(d.fullName) + '</button>';
+    out += '<button type="button" class="doc" data-id="' + esc(d.id) + '"' + (state.doctorId===d.id?' aria-pressed="true"':'') + '><span class="av">' + esc(initial(d.fullName)) + '</span>' + esc(d.fullName) + '</button>';
   }
   box.innerHTML=out;
   $$("#docs .doc").forEach(function(b){
@@ -952,7 +952,11 @@ function done(d){
     '</div>';
   var bar=$("#bottombar"); if(bar) bar.classList.remove("show");
   $("#againbtn").addEventListener("click", function(){ state.time=""; state.movedDay=false; render(); window.scrollTo({ top:0, behavior:"smooth" }); });
-  var mbtn=$("#managebtn"); if(mbtn) mbtn.addEventListener("click", function(){ location.href = a.manageUrl; });
+  var mbtn=$("#managebtn"); if(mbtn) mbtn.addEventListener("click", function(){
+    // server-minted, but never navigate blind: same-origin /booking/ only
+    var u = String(a.manageUrl || "");
+    if(u.indexOf(location.origin + "/booking/") === 0) location.href = u;
+  });
   $("#printbtn").addEventListener("click", function(){ window.print(); });
   $("#icsbtn").addEventListener("click", function(){ downloadIcs(a); });
   $("#copybtn").addEventListener("click", function(){

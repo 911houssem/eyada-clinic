@@ -48,6 +48,7 @@ const argOf = (name) => {
 const CREATE_OWNER = argv.includes("--create-owner");
 const RESTORE_FILE = argOf("restore");
 const VERIFY_BACKUP = argv.includes("--verify-backup");
+const ROTATE_KEY = argv.includes("--rotate-key");
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || argOf("port") || 3000);
@@ -148,7 +149,7 @@ function audit(req, action, meta = {}) {
 function runBackup(reason = "scheduled") {
   try {
     if (!fs.existsSync(DB_FILE)) return null;
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    fs.mkdirSync(BACKUP_DIR, { recursive: true, mode: 0o700 });
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     let dest;
     if (backupKey) {
@@ -183,6 +184,45 @@ function verifyBackupCli(file) {
   return ok;
 }
 
+/** `--rotate-key` — re-seal every field under NEW_ENCRYPTION_KEY (routine +
+ * emergency rotation). Needs ENCRYPTION_KEY=current and NEW_ENCRYPTION_KEY=new
+ * (different). Refuses when any sealed value does NOT open with the current
+ * key, so a wrong "current" key can never strand data under a key nobody has.
+ * After exit 0: set ENCRYPTION_KEY to the new secret, restart, take a fresh
+ * backup (old snapshots still need the old key to be read back).
+ */
+async function rotateKeyCli() {
+  const cur = process.env.ENCRYPTION_KEY || "";
+  const nxt = process.env.NEW_ENCRYPTION_KEY || "";
+  if (!cur) { fail("--rotate-key: set ENCRYPTION_KEY to the CURRENT key"); return false; }
+  if (!nxt || nxt === cur) { fail("--rotate-key: set NEW_ENCRYPTION_KEY to a DIFFERENT secret"); return false; }
+  load();           // opens sealed values with the current keys
+  refreshEncKeys(); // ensure a salt exists
+  const stuck = [];
+  for (const [coll, fields] of Object.entries(SENSITIVE_FIELDS)) {
+    const rows = db[coll];
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows) for (const f of fields) {
+      const v = row && row[f];
+      if (typeof v === "string" && v.startsWith(ENC_PREFIX) && openValue(v) === v)
+        stuck.push(`${coll}.${f}`);
+    }
+  }
+  if (stuck.length) {
+    fail(`--rotate-key refused: ${stuck.length} sealed value(s) do not open with ENCRYPTION_KEY (e.g. ${stuck[0]}). Wrong current key?`);
+    return false;
+  }
+  if (!db.meta || typeof db.meta !== "object") db.meta = {};
+  db.meta.encSalt = crypto.randomBytes(16).toString("hex"); // fresh salt: retired key material is useless now
+  encKey = deriveFieldKey(nxt, db.meta.encSalt);
+  encKeyLegacy = null; // the retired key must not open anything anymore
+  mapSensitive(db, sealValue); // memory holds plaintext -> seal everything with the new key
+  await flush();
+  log("--rotate-key done: every sealed field is now under NEW_ENCRYPTION_KEY.");
+  log("Next: set ENCRYPTION_KEY to the new secret, restart, and take a fresh backup.");
+  return true;
+}
+
 /** `--restore <file>` — validate + snapshot-current + overwrite db.json. */
 async function restoreCli(file) {
   const res = await backupLib.restore({
@@ -210,16 +250,66 @@ async function restoreCli(file) {
  */
 const ENC_PREFIX = "enc:v1:";
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
-const encKey = ENCRYPTION_KEY
-  ? crypto.createHash("sha256").update(String(ENCRYPTION_KEY)).digest()
-  : null;
+// Field keys. `encKey` is scrypt(secret, per-database salt); `encKeyLegacy` is
+// the pre-upgrade SHA-256(secret) and opens old values only. `let` because
+// --rotate-key swaps them at runtime.
+let encKey = null;
+let encKeyLegacy = null;
+const fieldKeyCache = new Map(); // "secret|salt" -> key (one scrypt per boot, not per value)
+
+function deriveFieldKey(secret, saltHex) {
+  const ck = `${secret}|${saltHex}`;
+  let k = fieldKeyCache.get(ck);
+  if (!k) {
+    k = crypto.scryptSync(String(secret), Buffer.from(saltHex, "hex"), 32);
+    fieldKeyCache.set(ck, k);
+  }
+  return k;
+}
+
+function legacyFieldKey(secret) {
+  return crypto.createHash("sha256").update(String(secret)).digest();
+}
+
+/** Point the module keys at `saltHex` (null = legacy-only, pre-salt database). */
+function initEncKeys(saltHex) {
+  if (!ENCRYPTION_KEY) { encKey = null; encKeyLegacy = null; return; }
+  encKeyLegacy = legacyFieldKey(ENCRYPTION_KEY);
+  encKey = (typeof saltHex === "string" && /^[0-9a-f]{32}$/.test(saltHex))
+    ? deriveFieldKey(ENCRYPTION_KEY, saltHex)
+    : encKeyLegacy;
+}
+
+/** Per-database salt, stored in db.meta (so it rides along with backups). */
+function ensureEncSalt() {
+  if (!db || typeof db !== "object") return null;
+  if (!db.meta || typeof db.meta !== "object") db.meta = {};
+  if (typeof db.meta.encSalt !== "string" || !/^[0-9a-f]{32}$/.test(db.meta.encSalt)) {
+    db.meta.encSalt = crypto.randomBytes(16).toString("hex");
+    save(); // persist the salt; the debounced flush re-seals with the new key
+  }
+  return db.meta.encSalt;
+}
+
+/** (Re)derive keys after load(). Safe to call twice; migrates legacy seals. */
+function refreshEncKeys() {
+  if (!ENCRYPTION_KEY) { encKey = null; encKeyLegacy = null; return; }
+  encKeyLegacy = legacyFieldKey(ENCRYPTION_KEY);
+  const salt = ensureEncSalt();
+  encKey = salt ? deriveFieldKey(ENCRYPTION_KEY, salt) : encKeyLegacy;
+}
 // Optional whole-file backup encryption (separate secret from ENCRYPTION_KEY so
 // the two can be rotated independently). When set, snapshots are written as
 // `db-<ts>.json.enc` (AES-256-GCM) and never contain the plaintext database.
 const BACKUP_ENCRYPT_KEY = process.env.BACKUP_ENCRYPT_KEY || null;
 const backupKey = BACKUP_ENCRYPT_KEY ? backupLib.deriveKey(BACKUP_ENCRYPT_KEY) : null;
 const SENSITIVE_FIELDS = {
-  patients: ["bloodType", "allergies"],
+  // Free-text clinical content: sealed at rest, plaintext only in memory/API.
+  // Identity/contact fields (name, phone, email, fileNumber, insurance refs,
+  // appointment titles) stay searchable plaintext BY DESIGN — see the coverage
+  // test (tests/test-encryption-coverage.js) which prints that list for review.
+  patients: ["bloodType", "allergies", "notes"],
+  appointments: ["notes"],
   records: ["chiefComplaint", "diagnosis", "treatment", "notes"],
   // The TOTP seed is a live second factor: it must never sit in db.json in clear
   // (or in the rotated backups). Legacy plaintext values are sealed on the first
@@ -230,25 +320,30 @@ const SENSITIVE_FIELDS = {
   notificationConfigs: ["whatsappToken", "webhookSecret", "smtpPassword"],
 };
 
-function sealValue(v) {
-  if (!encKey || typeof v !== "string" || !v || v.startsWith(ENC_PREFIX)) return v;
+function sealValue(v, key = encKey) {
+  if (!key || typeof v !== "string" || !v || v.startsWith(ENC_PREFIX)) return v;
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", encKey, iv);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
   const ct = Buffer.concat([cipher.update(v, "utf8"), cipher.final()]);
   return ENC_PREFIX + [iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), ct.toString("base64url")].join(":");
 }
 
 function openValue(v) {
   if (typeof v !== "string" || !v.startsWith(ENC_PREFIX)) return v;
-  if (!encKey) return v; // key missing: keep the ciphertext rather than lose data
-  const [, , ivb, tagb, ctb] = v.split(":");
-  try {
-    const d = crypto.createDecipheriv("aes-256-gcm", encKey, Buffer.from(ivb, "base64url"));
-    d.setAuthTag(Buffer.from(tagb, "base64url"));
-    return Buffer.concat([d.update(Buffer.from(ctb, "base64url")), d.final()]).toString("utf8");
-  } catch {
-    return v; // wrong key / tampered value: never throw on read
+  const parts = v.split(":");
+  if (parts.length !== 5) return v;
+  const [, , ivb, tagb, ctb] = parts;
+  // current key first, legacy SHA-256(secret) second: values sealed before the
+  // scrypt upgrade open transparently and are re-sealed on the next save.
+  for (const k of [encKey, encKeyLegacy]) {
+    if (!k) continue;
+    try {
+      const d = crypto.createDecipheriv("aes-256-gcm", k, Buffer.from(ivb, "base64url"));
+      d.setAuthTag(Buffer.from(tagb, "base64url"));
+      return Buffer.concat([d.update(Buffer.from(ctb, "base64url")), d.final()]).toString("utf8");
+    } catch { /* try the next key */ }
   }
+  return v; // wrong key / tampered value: never throw on read, never lose data
 }
 
 function mapSensitive(obj, fn) {
@@ -276,8 +371,10 @@ function hardenPerms() {
   for (const f of [DB_FILE, TMP_FILE, SESSIONS_FILE, AUDIT_FILE, path.join(DATA_DIR, "server.log")])
     if (fs.existsSync(f)) chmodSafe(f, 0o600);
   try {
-    if (fs.existsSync(BACKUP_DIR))
+    if (fs.existsSync(BACKUP_DIR)) {
+      chmodSafe(BACKUP_DIR, 0o700); // the directory itself, not just the files inside
       for (const f of fs.readdirSync(BACKUP_DIR)) chmodSafe(path.join(BACKUP_DIR, f), 0o600);
+    }
   } catch { /* best effort */ }
 }
 
@@ -464,7 +561,7 @@ function readBody(req) {
       if (!raw.trim()) return done({});
       try {
         const parsed = JSON.parse(raw);
-        done(parsed && typeof parsed === "object" ? parsed : {});
+        done(parsed && typeof parsed === "object" ? sanitizeInput(parsed) : {});
       } catch {
         done({});
       }
@@ -472,6 +569,36 @@ function readBody(req) {
     req.on("error", () => done({}));
     req.on("aborted", () => done({}));
   });
+}
+
+/* ── Input sanitisation (single layer) ──
+ * Defence in depth ONLY: strips C0 control chars (except tab/LF/CR) and caps
+ * every string, in the one funnel every JSON body passes through. Output
+ * escaping (esc() in the booking page, JSON content-types on the API) remains
+ * the real XSS boundary — this just keeps junk (null bytes, bell chars,
+ * megabyte strings, proto keys) out of the database and the logs.
+ */
+const INPUT_STRING_MAX = 20_000;
+const INPUT_CONTROL_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+function sanitizeInput(v, depth = 0) {
+  if (typeof v === "string") {
+    if (v.length > INPUT_STRING_MAX) v = v.slice(0, INPUT_STRING_MAX);
+    return INPUT_CONTROL_RE.test(v) ? v.replace(INPUT_CONTROL_RE, "") : v;
+  }
+  if (Array.isArray(v)) {
+    if (depth > 32) return [];
+    for (let i = 0; i < v.length; i++) v[i] = sanitizeInput(v[i], depth + 1);
+    return v;
+  }
+  if (v && typeof v === "object") {
+    if (depth > 32) return {};
+    for (const k of Object.keys(v)) {
+      if (k === "__proto__" || k === "constructor" || k === "prototype") { delete v[k]; continue; }
+      v[k] = sanitizeInput(v[k], depth + 1);
+    }
+    return v;
+  }
+  return v;
 }
 
 /**
@@ -519,6 +646,7 @@ const EMPTY = {
   tasks: [], records: [], inventory: [], messages: [], services: [],
   plans: [], clinicSubscriptions: [], offers: [], auditLog: [],
   notificationConfigs: [], notificationQueue: [], notificationLog: [],
+  inviteCodes: [],
 };
 
 /**
@@ -844,6 +972,7 @@ function load() {
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, "utf8");
       const parsed = JSON.parse(raw);
+      initEncKeys(parsed && parsed.meta && parsed.meta.encSalt); // the salt lives in the file itself
       mapSensitive(parsed, openValue); // decrypt medical fields if ENCRYPTION_KEY is set
       db = normalize(parsed);
       const notes = migrate();
@@ -1699,8 +1828,52 @@ function route(method, pattern, handler) {
 
 /* ── AUTH ── */
 
+/* ── Public registration policy ──
+ * REGISTRATION=open   anyone may self-register (dev default)
+ * REGISTRATION=invite self-registration needs a single-use invite code minted
+ *                     by the site owner (PROD default is closed, not invite)
+ * REGISTRATION=closed no self-registration at all (PROD default)
+ * Unknown values fail safe to "closed". On top of the mode: a strict per-IP
+ * rate limit, and a cap on never-activated trial clinics (the abuse surface).
+ */
+const _regRaw = String(process.env.REGISTRATION || (IS_PROD ? "closed" : "open")).toLowerCase();
+const REGISTRATION = ["open", "invite", "closed"].includes(_regRaw) ? _regRaw : "closed";
+const REGISTER_MAX_PER_HOUR = Number(process.env.REGISTER_MAX_PER_HOUR || 3);
+const REGISTER_WINDOW_MS = 60 * 60 * 1000;
+const MAX_PENDING_CLINICS = Number(process.env.MAX_PENDING_CLINICS || 20);
+const registerHits = new Map(); // ip -> { count, until }
+
+function assertRegisterAllowed(req) {
+  const ip = clientIp(req);
+  const r = registerHits.get(ip) || { count: 0, until: 0 };
+  if (r.until <= Date.now()) { r.count = 0; r.until = Date.now() + REGISTER_WINDOW_MS; }
+  r.count++;
+  registerHits.set(ip, r);
+  if (r.count > REGISTER_MAX_PER_HOUR)
+    throw new AppError(429, "تجاوزت حد إنشاء الحسابات المسموح. حاول مرة أخرى بعد ساعة.");
+}
+
+/** Clinics still on a live trial that never paid — the abuse surface. */
+function pendingClinics() {
+  return db.clinics.filter((c) => {
+    const sub = accessSubscription(c.id);
+    return !!sub && sub.status === "trial";
+  });
+}
+
 route("POST", "/api/auth/register", async (req, res) => {
   const b = await readBody(req);
+  assertRegisterAllowed(req);
+  if (REGISTRATION === "closed")
+    throw new AppError(403, "التسجيل العام مغلق حالياً — تواصل مع إدارة الموقع للحصول على حساب.");
+  let invite = null;
+  if (REGISTRATION === "invite") {
+    invite = db.inviteCodes.find((x) => String(x.code) === String(b.inviteCode || "") && !x.usedAt
+      && (!x.expiresAt || Date.parse(x.expiresAt) >= Date.now()));
+    if (!invite) throw new AppError(403, "التسجيل يتطلب رمز دعوة صالحاً.");
+  }
+  if (pendingClinics().length >= MAX_PENDING_CLINICS)
+    throw new AppError(429, "بلغ عدد العيادات التجريبية المعلقة الحد الأقصى — حاول لاحقاً.");
   const username = String(b.username || "").trim();
   const password = String(b.password || "");
   const fullName = String(b.fullName || "").trim();
@@ -1745,10 +1918,34 @@ route("POST", "/api/auth/register", async (req, res) => {
   }
 
   const user = db.users.find((u) => u.id === userId);
+  if (invite) { invite.usedAt = now(); invite.usedBy = userId; }
   createSession(req, res, userId);
   save();
   audit(req, "register.success", { actorId: userId, username, detail: clinicId });
   json(res, 200, { user: publicUser(user), currentClinicId: clinicId });
+});
+
+/* ── Invite codes (site owner only) ──
+ * Single-use, expiring codes that unlock registration in invite mode.
+ */
+route("POST", "/api/invites", async (req, res) => {
+  const s = requireSuperAdmin(req);
+  const b = await readBody(req);
+  const days = Math.min(90, Math.max(1, num(b.daysValid, 7)));
+  const code = "INV-" + crypto.randomBytes(6).toString("hex").toUpperCase();
+  db.inviteCodes.push({
+    code, createdBy: s.user.id, createdAt: now(),
+    expiresAt: new Date(Date.now() + days * 864e5).toISOString(),
+    usedAt: null, usedBy: "",
+  });
+  save();
+  audit(req, "invite.create", { detail: code });
+  json(res, 200, { code });
+});
+
+route("GET", "/api/invites", async (req, res) => {
+  requireSuperAdmin(req);
+  json(res, 200, db.inviteCodes);
 });
 
 route("POST", "/api/auth/login", async (req, res) => {
@@ -1838,37 +2035,44 @@ route("POST", "/api/auth/forgot", async (req, res) => {
   assertResetAllowed(req, account);
 
   const user = findUserByAccount(account);
-  // Always do comparable work + always return the same body so the endpoint
-  // cannot be used to enumerate accounts (or their existence) by timing/response.
+  // Timing-attack firewall: the response goes out BEFORE any account-dependent
+  // work, and all of that work runs in the background. Both branches therefore
+  // cost the client exactly one JSON encode — account existence is invisible in
+  // the body AND on the clock (previously the unknown-account branch burned a
+  // ~55ms scrypt while the known branch answered in ~2ms).
   const genericOk = { success: true, message: "إن كان الحساب موجوداً فستصلك رسالة لإعادة تعيين كلمة المرور." };
-
-  if (user) {
-    pruneResets();
-    const token = crypto.randomBytes(32).toString("hex");
-    resets[sha256(token)] = {
-      userId: user.id,
-      createdAt: now(),
-      expiresAt: new Date(Date.now() + LIMITS.resetTtlMs).toISOString(),
-      usedAt: null,
-    };
-    saveResets();
-    const link = `${publicBaseUrl()}/?resetToken=${token}`;
-    // Delivered through the notifier abstraction, never inline.
-    const result = await notify.send({
-      channel: process.env.NOTIFY_CHANNEL || "console",
-      to: user.email || user.phone || user.username,
-      templateKey: "password_reset",
-      clinicId: user.clinicId || null,
-      vars: { name: user.fullName || user.username, link, ttlMinutes: Math.round(LIMITS.resetTtlMs / 60000) },
-    });
-    if (!result || !result.ok) log(`reset link for ${user.username}: ${link}`);
-    audit(req, "password.reset.request", { actorId: user.id, username: user.username });
-  } else {
-    // burn roughly the same CPU as the real branch (scrypt) to level timing
-    hashPassword(crypto.randomBytes(12).toString("hex"));
-    audit(req, "password.reset.request", { username: account, detail: "unknown-account" });
-  }
   json(res, 200, genericOk);
+
+  setImmediate(async () => {
+    try {
+      if (user) {
+        pruneResets();
+        const token = crypto.randomBytes(32).toString("hex");
+        resets[sha256(token)] = {
+          userId: user.id,
+          createdAt: now(),
+          expiresAt: new Date(Date.now() + LIMITS.resetTtlMs).toISOString(),
+          usedAt: null,
+        };
+        saveResets();
+        const link = `${publicBaseUrl()}/?resetToken=${token}`;
+        // Delivered through the notifier abstraction, never inline.
+        const result = await notify.send({
+          channel: process.env.NOTIFY_CHANNEL || "console",
+          to: user.email || user.phone || user.username,
+          templateKey: "password_reset",
+          clinicId: user.clinicId || null,
+          vars: { name: user.fullName || user.username, link, ttlMinutes: Math.round(LIMITS.resetTtlMs / 60000) },
+        });
+        if (!result || !result.ok) log(`reset link for ${user.username}: ${link}`);
+        audit(req, "password.reset.request", { actorId: user.id, username: user.username });
+      } else {
+        audit(req, "password.reset.request", { username: account, detail: "unknown-account" });
+      }
+    } catch (e) {
+      warn("forgot background work failed:", e && e.message);
+    }
+  });
 });
 
 route("POST", "/api/auth/reset", async (req, res) => {
@@ -1880,8 +2084,13 @@ route("POST", "/api/auth/reset", async (req, res) => {
 
   const hash = sha256(token);
   const rec = resets[hash];
-  if (!rec || rec.usedAt || (Date.parse(rec.expiresAt) || 0) < Date.now())
+  if (!rec || rec.usedAt || (Date.parse(rec.expiresAt) || 0) < Date.now()) {
+    // Same principle as /forgot: the valid branch burns scrypt (verify + hash),
+    // so burn one here too. Reset tokens are unguessable, but there is no reason
+    // to hand out a fast/slow oracle for free.
+    hashPassword(crypto.randomBytes(12).toString("hex"));
     throw new AppError(400, "رابط إعادة التعيين غير صالح أو منتهي الصلاحية");
+  }
 
   const user = db.users.find((u) => u.id === rec.userId);
   if (!user) throw new AppError(400, "رابط إعادة التعيين غير صالح أو منتهي الصلاحية");
@@ -2335,7 +2544,7 @@ function publicNotifyConfig(clinicId) {
 function providerConfig(clinicId) {
   const c = notifyConfig(clinicId) || {};
   if ((c.channel || "console") === "whatsapp-cloud")
-    return { phoneNumberId: c.whatsappPhoneNumberId, accessToken: c.whatsappToken, language: c.language, templates: c.providerTemplates || {} };
+    return { phoneNumberId: c.whatsappPhoneNumberId, accessToken: c.whatsappToken, language: c.language, templates: c.providerTemplates || {}, apiBase: c.whatsappApiBase || undefined };
   if (c.channel === "webhook") return { url: c.webhookUrl, secret: c.webhookSecret };
   return {};
 }
@@ -2471,8 +2680,8 @@ route("GET", "/api/notifications", async (req, res, p, url) => {
     .slice(-100).reverse()
     .map((j) => ({
       id: j.id, templateKey: j.templateKey, to: maskTo(j.to), channel: j.channel,
-      status: j.status, attempts: j.attempts, createdAt: j.createdAt,
-      sentAt: j.sentAt, lastError: redact(j.lastError),
+      status: j.status, attempts: j.attempts, nextAttemptAt: j.nextAttemptAt || null,
+      createdAt: j.createdAt, sentAt: j.sentAt, lastError: redact(j.lastError),
     }));
   const log = db.notificationLog.filter((l) => l.clinicId === clinicId).slice(-100).reverse();
   json(res, 200, { config: publicNotifyConfig(clinicId), queue, log });
@@ -2503,6 +2712,11 @@ route("PUT", "/api/notifications", async (req, res, p, url) => {
   if (b.templates !== undefined && b.templates) row.templates = { ...(row.templates || {}), ...b.templates };
   if (b.whatsappPhoneNumberId !== undefined) row.whatsappPhoneNumberId = String(b.whatsappPhoneNumberId);
   if (b.whatsappLanguage !== undefined) row.language = String(b.whatsappLanguage);
+  if (b.whatsappApiBase !== undefined) {
+    const base = String(b.whatsappApiBase || "").trim().replace(/\/+$/, "");
+    if (base && !/^https?:\/\//i.test(base)) throw badRequest("رابط API واتساب يجب أن يبدأ بـ http(s)://");
+    row.whatsappApiBase = base;
+  }
   if (b.webhookUrl !== undefined) row.webhookUrl = String(b.webhookUrl);
   // secrets: overwrite only when a value is supplied; "" clears
   if (b.whatsappToken !== undefined) row.whatsappToken = String(b.whatsappToken || "");
@@ -3913,15 +4127,17 @@ const { buildBookingPage } = require("./booking-page.js");
  * Resolve the clinic behind the slug and hand the resolved values to the
  * standalone builder in booking-page.js, which owns the page's HTML/CSS/JS.
  */
-function bookingPage(slug) {
+function bookingPage(slug, nonce) {
   const clinic = clinicBySlug(slug);
   const name = clinic ? clinic.name : "عيادة";
   const ok = !!clinic && !!clinic.bookingEnabled;
-  return buildBookingPage({
+  const html = buildBookingPage({
     slug: ok ? slug : null,
     name,
     daysAhead: BOOKING_WINDOW.daysAhead,
   });
+  // the builder emits exactly one inline <script>: arm it with the CSP nonce
+  return nonce ? html.replace("<script>", `<script nonce="${nonce}">`) : html;
 }
 
 /* ── BACKUP ── */
@@ -4077,10 +4293,11 @@ async function serveStatic(req, res, urlPath) {
       const idx = path.join(target, "index.html");
       st = await statOrNull(idx);
       if (st && st.isFile())
-        return pipeFile(req, res, idx, st, "no-store");
+        return serveHtmlWithNonce(req, res, idx);
     } else if (st && st.isFile()) {
       const ext = path.extname(target).toLowerCase();
-      return pipeFile(req, res, target, st, ext === ".html" ? "no-store" : "public, max-age=3600");
+      if (ext === ".html") return serveHtmlWithNonce(req, res, target);
+      return pipeFile(req, res, target, st, "public, max-age=3600");
     }
   }
 
@@ -4088,10 +4305,27 @@ async function serveStatic(req, res, urlPath) {
   if (spaFallbackAllowed(urlPath)) {
     const shell = path.join(ROOT, "index.html");
     const st = await statOrNull(shell);
-    if (st && st.isFile()) return pipeFile(req, res, shell, st, "no-store");
+    if (st && st.isFile()) return serveHtmlWithNonce(req, res, shell);
   }
 
   return false;
+}
+
+/** Serve an HTML shell with the per-response CSP nonce on every <script> tag,
+ * so script-src needs no 'unsafe-inline'. Navigations only — assets stream. */
+async function serveHtmlWithNonce(req, res, file) {
+  try {
+    let html = await fsp.readFile(file, "utf8");
+    const nonce = req.cspNonce || "";
+    if (nonce) html = html.replace(/<script(?=[\s>])/g, `<script nonce="${nonce}"`);
+    respond(res, 200, html, {
+      "Content-Type": `${MIME[".html"]}; charset=utf-8`,
+      "Cache-Control": "no-store",
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /* ══════════════════════════ 10. REQUEST PIPELINE ══════════════════════════ */
@@ -4106,18 +4340,22 @@ function securityHeaders(req, res) {
   res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=(), usb=()");
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-  // The exported SPA + booking page both embed a small inline <script> and use
-  // inline style attributes, so 'unsafe-inline' is required for script/style.
+  // script-src has NO 'unsafe-inline': every first-party inline <script> (the
+  // app shell's 9 boot scripts, the booking page's single script) carries the
+  // per-response nonce injected below. style-src keeps 'unsafe-inline' because
+  // React sets style="" attributes at runtime — style injection cannot run
+  // script in modern browsers, and hashing every runtime style is infeasible.
   // Everything else is locked to same-origin and objects are disabled.
+  const nonce = (req && req.cspNonce) || "missing";
   res.setHeader("Content-Security-Policy", [
     "default-src 'self'",
-    "script-src 'self' 'unsafe-inline'",
+    `script-src 'self' 'nonce-${nonce}'`,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "font-src 'self' data:",
     "connect-src 'self'",
     "object-src 'none'",
-    "base-uri 'self'",
+    "base-uri 'none'",
     "form-action 'self'",
     "frame-ancestors 'none'",
   ].join("; "));
@@ -4212,6 +4450,7 @@ function assertRequestSafe(req) {
 }
 
 async function handle(req, res) {
+  req.cspNonce = crypto.randomBytes(16).toString("base64"); // per-response CSP nonce
   cors(req, res);
 
   if (req.method === "OPTIONS") {
@@ -4274,7 +4513,7 @@ async function handle(req, res) {
     if (bmatch) {
       let slug = "";
       try { slug = decodeURIComponent(bmatch[1]); } catch { slug = bmatch[1]; }
-      respond(res, 200, bookingPage(slug), {
+      respond(res, 200, bookingPage(slug, req.cspNonce), {
         "Content-Type": `${MIME[".html"]}; charset=utf-8`,
         "Cache-Control": "no-store",
         "X-Robots-Tag": "noindex",
@@ -4506,9 +4745,12 @@ if (RESTORE_FILE) {
   restoreCli(path.resolve(RESTORE_FILE)).then((ok) => process.exit(ok ? 0 : 1));
 } else if (VERIFY_BACKUP) {
   process.exit(verifyBackupCli(argOf("verify-backup")) ? 0 : 1);
+} else if (ROTATE_KEY) {
+  rotateKeyCli().then((ok) => process.exit(ok ? 0 : 1));
 } else {
   startupChecks();
   load();
+  refreshEncKeys(); // scrypt key from ENCRYPTION_KEY + salt (creates the salt on first run, migrates legacy seals on save)
   if (CREATE_OWNER) {
     createOwnerCli();
     flush().then(() => process.exit(0)).catch(() => process.exit(1));

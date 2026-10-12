@@ -282,8 +282,11 @@ const isDenied = (st) => st === 403 || st === 404;
     check("CSP: default-src 'self'", csp.includes("default-src 'self'"));
     check("CSP: object-src 'none'", csp.includes("object-src 'none'"));
     check("CSP: no unsafe-eval", !csp.includes("unsafe-eval"));
+    check("CSP: script-src has no 'unsafe-inline' (nonces instead)", !/script-src[^;]*unsafe-inline/.test(csp), csp.split(";").find((d) => d.includes("script-src")) || "");
+    check("CSP: booking inline script carries the nonce", /<script nonce="[A-Za-z0-9+/=]+">/.test(bookA.text));
     const shell = await req("GET", "/");
     check("CSP present on the SPA shell too", (shell.headers["content-security-policy"] || "").includes("default-src 'self'"));
+    check("CSP: shell scripts carry the nonce", /<script nonce="[A-Za-z0-9+/=]+"/.test(shell.text));
     check("nosniff header present", shell.headers["x-content-type-options"] === "nosniff");
 
     /* ───────────────────────── 4. ENUMERATION + CORS ───────────────────────── */

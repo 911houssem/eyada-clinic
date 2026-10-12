@@ -3,10 +3,12 @@
 /**
  * Meta WhatsApp Cloud API provider (no dependencies — native fetch).
  *
- * config = { phoneNumberId, accessToken, apiVersion?, language?, templates? }
- * templateKey is mapped to an APPROVED template name via `templates`
- * (templateKey -> { name, language }) with a safe fallback. Only template
- * messages are sent (business-initiated messages must use approved templates).
+ * config = { phoneNumberId, accessToken, apiVersion?, language?, templates?,
+ *             apiBase? }
+ * `apiBase` defaults to https://graph.facebook.com and exists so tests (and
+ * locked-down networks) can point the provider at a mock / proxy. Only
+ * template messages are sent (business-initiated messages must use approved
+ * templates).
  */
 module.exports = {
   name: "whatsapp-cloud",
@@ -37,7 +39,7 @@ module.exports = {
       },
     };
 
-    const url = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`;
+    const url = `${String(config.apiBase || "https://graph.facebook.com").replace(/\/+$/, "")}/${apiVersion}/${phoneNumberId}/messages`;
     const res = await fetch(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
