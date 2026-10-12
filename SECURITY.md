@@ -147,6 +147,9 @@
 | `REGISTRATION` | `open` (تطوير) / `closed` (إنتاج) | سياسة التسجيل العام: `open` \| `invite` (رمز دعوة لمرة واحدة عبر `POST /api/invites` من مالك الموقع) \| `closed` — القيم المجهولة تسقط إلى `closed` |
 | `REGISTER_MAX_PER_HOUR` | `3` | حد إنشاء الحسابات لكل IP في الساعة (كل الأوضاع) |
 | `MAX_PENDING_CLINICS` | `20` | حد العيادات التجريبية المعلقة التي لم تدفع أبداً؛ تجاوزه يرفض التسجيل المفتوح بـ 429 |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | — | مرحّل البريد (587 افتراضياً، 465=TLS ضمني، `SMTP_SECURE=1` يجبره، `SMTP_REJECT_UNAUTHORIZED=0` للشهادات الذاتية فقط) |
+| `FILE_MAX_BYTES` | `3145728` (3MB) | حد حجم ملف المريض الواحد (base64 عبر JSON — يجب أن يبقى أقل من حد الجسم ~5MB) |
+| `PAYMENTS_WEBHOOK_SECRET` | — | سرّ HMAC لتوقيع webhooks الدفع (transfer/mock) — بدون تكامل حقيقي بعد |
 | `BACKUP_ENCRYPT_KEY` | — | اختياري: تشفير ملفات النسخ الاحتياطي كاملةً (سرّ مستقل يُدَار وحدَه) |
 | `TRASH_TTL_DAYS` | `30` | أيام الاحتفاظ بالعناصر المحذوفة (حذفها ناعماً) قبل الإتلاف |
 | `PUBLIC_URL` | `http://HOST:PORT` | الأساس المستخدم لبناء روابط إعادة تعيين كلمة المرور |

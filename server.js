@@ -19,6 +19,7 @@ const fsp = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const notify = require("./notifiers");
+const payments = require("./payments");
 const backupLib = require("./scripts/backup.js");
 
 /* ══════════════════════════ 1. CONFIG ══════════════════════════ */
@@ -39,6 +40,7 @@ const SESSIONS_FILE = path.join(DATA_DIR, "sessions.json");
 const RESETS_FILE = path.join(DATA_DIR, "resets.json");
 const AUDIT_FILE = path.join(DATA_DIR, "audit.log");
 const BACKUP_DIR = path.join(DATA_DIR, "backups");
+const FILES_DIR = path.join(DATA_DIR, "files"); // patient uploads: random names, never under the static root
 
 const argv = process.argv.slice(2);
 const argOf = (name) => {
@@ -49,6 +51,7 @@ const CREATE_OWNER = argv.includes("--create-owner");
 const RESTORE_FILE = argOf("restore");
 const VERIFY_BACKUP = argv.includes("--verify-backup");
 const ROTATE_KEY = argv.includes("--rotate-key");
+const ROTATE_SESSIONS = argv.includes("--rotate-sessions");
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || argOf("port") || 3000);
@@ -78,6 +81,9 @@ const LIMITS = {
 
 const started = Date.now();
 const stamp = () => new Date().toISOString().replace("T", " ").slice(0, 19);
+
+/** Operational counters for /api/metrics (in-memory, cumulative per boot). */
+const METRICS = { requests: 0, errors4xx: 0, errors5xx: 0, latencyMs: 0 };
 
 const log = (...a) => console.log(`[${stamp()}]`, ...a);
 const warn = (...a) => console.warn(`[${stamp()}] WARN`, ...a);
@@ -318,6 +324,10 @@ const SENSITIVE_FIELDS = {
   // Provider credentials (WhatsApp Cloud token, webhook HMAC secret, SMTP
   // password) are sealed exactly like medical data and never echoed by the API.
   notificationConfigs: ["whatsappToken", "webhookSecret", "smtpPassword"],
+  // Original upload names may describe the content ("chest-xray.png").
+  patientFiles: ["filename"],
+  // Prescription content is medication data: notes + every item sub-field.
+  prescriptions: ["notes", "items.name", "items.dose", "items.duration", "items.instructions"],
 };
 
 function sealValue(v, key = encKey) {
@@ -350,7 +360,17 @@ function mapSensitive(obj, fn) {
   for (const [coll, fields] of Object.entries(SENSITIVE_FIELDS)) {
     const rows = obj && obj[coll];
     if (!Array.isArray(rows)) continue;
-    for (const row of rows) for (const f of fields) if (typeof row[f] === "string" && row[f]) row[f] = fn(row[f]);
+    for (const row of rows) for (const f of fields) {
+      if (!f.includes(".")) {
+        if (typeof row[f] === "string" && row[f]) row[f] = fn(row[f]);
+      } else {
+        // dotted "items.name": seal a string key inside each array element
+        const dot = f.indexOf(".");
+        const arr = row[f.slice(0, dot)], sub = f.slice(dot + 1);
+        if (Array.isArray(arr)) for (const it of arr)
+          if (it && typeof it[sub] === "string" && it[sub]) it[sub] = fn(it[sub]);
+      }
+    }
   }
   return obj;
 }
@@ -374,6 +394,10 @@ function hardenPerms() {
     if (fs.existsSync(BACKUP_DIR)) {
       chmodSafe(BACKUP_DIR, 0o700); // the directory itself, not just the files inside
       for (const f of fs.readdirSync(BACKUP_DIR)) chmodSafe(path.join(BACKUP_DIR, f), 0o600);
+    }
+    if (fs.existsSync(FILES_DIR)) {
+      chmodSafe(FILES_DIR, 0o700);
+      for (const f of fs.readdirSync(FILES_DIR)) chmodSafe(path.join(FILES_DIR, f), 0o600);
     }
   } catch { /* best effort */ }
 }
@@ -646,7 +670,7 @@ const EMPTY = {
   tasks: [], records: [], inventory: [], messages: [], services: [],
   plans: [], clinicSubscriptions: [], offers: [], auditLog: [],
   notificationConfigs: [], notificationQueue: [], notificationLog: [],
-  inviteCodes: [],
+  inviteCodes: [], patientFiles: [], prescriptions: [], payments: [],
 };
 
 /**
@@ -1617,6 +1641,7 @@ const PUBLIC_API = [
   /^\/api\/public\//,
   /^\/api\/subscriptions\/?$/,
   /^\/api\/offers\/?$/,
+  /^\/api\/payments\/webhook$/, // sessionless by design: the HMAC signature IS the authentication
 ];
 
 function enforcePermission(req, urlPath) {
@@ -2275,6 +2300,29 @@ route("GET", "/api/health", async (req, res) => {
   });
 });
 
+/** Site-owner-only operational metrics (alerting source for backup/queue). */
+route("GET", "/api/metrics", async (req, res) => {
+  const s = requireSession(req);
+  if (!isSiteOwner(s.user)) throw forbidden("المقاييس لمالك الموقع فقط");
+  let backupAgeSec = null;
+  const newest = backupLib.newestBackup(BACKUP_DIR);
+  if (newest) { try { backupAgeSec = Math.round((Date.now() - fs.statSync(newest).mtimeMs) / 1000); } catch { /* ignore */ } }
+  json(res, 200, {
+    uptimeSec: Math.round((Date.now() - started) / 1000),
+    requests: METRICS.requests,
+    errors4xx: METRICS.errors4xx,
+    errors5xx: METRICS.errors5xx,
+    avgLatencyMs: METRICS.requests ? Math.round(METRICS.latencyMs / METRICS.requests) : 0,
+    queuePending: db.notificationQueue.filter((j) => j.status === "pending").length,
+    queueFailed: db.notificationQueue.filter((j) => j.status === "failed").length,
+    sessions: Object.keys(sessions).length,
+    backupAgeSec,
+    backups: backupLib.listBackups(BACKUP_DIR).length,
+    memoryMB: Math.round(process.memoryUsage().rss / 1048576),
+    node: process.version,
+  });
+});
+
 /* ── CLINICS ── */
 
 route("GET", "/api/clinics", async (req, res, p, url) => {
@@ -2336,6 +2384,13 @@ route("PUT", "/api/clinics", async (req, res) => {
   // (holidays, full schedule, maintenance) with an optional notice + reopen date.
   if (b.siteClosedMessage !== undefined) clinic.siteClosedMessage = String(b.siteClosedMessage || "").slice(0, 500);
   if (b.siteClosedUntil !== undefined) clinic.siteClosedUntil = String(b.siteClosedUntil || "").slice(0, 40);
+  if (b.privacyPolicy !== undefined) clinic.privacyPolicy = String(b.privacyPolicy || "").slice(0, 10000);
+  if (b.terms !== undefined) clinic.terms = String(b.terms || "").slice(0, 10000);
+  if (b.retentionDays !== undefined) {
+    const d = Math.floor(num(b.retentionDays, 0));
+    if (d < 0 || d > 3650) throw badRequest("مدة الاحتفاظ يجب أن تكون بين 0 و3650 يوماً (0 = احتفاظ دائم)");
+    clinic.retentionDays = d;
+  }
   if (b.siteClosed !== undefined) {
     const closed = !!b.siteClosed;
     if (closed !== !!clinic.siteClosed) {
@@ -2371,6 +2426,8 @@ const TRASH_TYPES = {
   inventory: { coll: "inventory", label: "الصنف", search: ["itemName", "itemNameEn", "category", "supplier"] },
   services: { coll: "services", label: "الخدمة", search: ["name"] },
   tasks: { coll: "tasks", label: "المهمة", search: ["title"] },
+  patientFiles: { coll: "patientFiles", label: "ملف طبي", search: ["filename"], onPurge: deletePatientFileBytes },
+  prescriptions: { coll: "prescriptions", label: "وصفة", search: ["notes"] },
 };
 
 const isLive = (x) => !!x && !x.deletedAt;
@@ -2406,11 +2463,13 @@ function migrateSoftDelete() {
 function purgeExpiredTrash() {
   const t = Date.now();
   let removed = 0;
-  for (const { coll } of Object.values(TRASH_TYPES)) {
+  for (const { coll, onPurge } of Object.values(TRASH_TYPES)) {
     const before = db[coll].length;
     db[coll] = db[coll].filter((row) => {
       if (!row.deletedAt) return true;
-      return t - (Date.parse(row.deletedAt) || 0) < LIMITS.trashTtlMs;
+      const expired = t - (Date.parse(row.deletedAt) || 0) >= LIMITS.trashTtlMs;
+      if (expired && onPurge) { try { onPurge(row); } catch { /* bytes best-effort */ } }
+      return !expired;
     });
     removed += before - db[coll].length;
   }
@@ -2506,7 +2565,8 @@ route("DELETE", "/api/trash/:type/:id", async (req, res, p) => {
   const i = db[def.coll].findIndex((x) => x.id === p.id && !isLive(x));
   if (i < 0) throw notFound("غير موجود في المهملات");
   if (!ownedClinicIds(s.user).includes(db[def.coll][i].clinicId)) throw forbidden("هذه العيادة ليست لك");
-  db[def.coll].splice(i, 1);
+  const [gone] = db[def.coll].splice(i, 1);
+  if (gone && def.onPurge) { try { def.onPurge(gone); } catch { /* bytes best-effort */ } }
   save();
   audit(req, "trash.purge", { detail: `${p.type}:${p.id}` });
   json(res, 200, { success: true });
@@ -2780,8 +2840,20 @@ function appointmentPatientPhone(appt) {
   return p ? p.phone : "";
 }
 
-route("GET", "/api/public/booking/:slug/appointment", async (req, res, p, url) => {
-  const { clinic, appt } = manageAppointment(p.slug, url.searchParams.get("token"));
+/** Public clinic policy/terms (booking page links them; starters need legal review). */
+route("GET", "/api/public/booking/:slug/policy", async (req, res, p) => {
+  const clinic = clinicBySlug(p.slug);
+  if (!clinic || clinic.bookingEnabled === false) throw notFound("العيادة غير موجودة");
+  res.setHeader("Cache-Control", "no-store");
+  json(res, 200, {
+    clinicName: clinic.name,
+    privacyPolicy: clinic.privacyPolicy || DEFAULT_PRIVACY_POLICY,
+    terms: clinic.terms || DEFAULT_TERMS,
+    customized: !!(clinic.privacyPolicy || clinic.terms),
+  });
+});
+
+route("GET", "/api/public/booking/:slug/appointment", async (req, res, p, url) => {  const { clinic, appt } = manageAppointment(p.slug, url.searchParams.get("token"));
   const parts = clinicDateParts(clinic.timezone || "Asia/Riyadh", Date.parse(appt.startTime));
   json(res, 200, {
     appointment: {
@@ -2911,6 +2983,7 @@ route("POST", "/api/patients", async (req, res) => {
     insuranceNumber: b.insuranceNumber || "", insuranceCompany: b.insuranceCompany || "",
     notes: b.notes || "", createdAt: now(),
   };
+  if (b.consent === true) { patient.consentAt = now(); patient.consentVersion = CONSENT_VERSION; }
   db.patients.push(patient);
   save();
   json(res, 200, patient);
@@ -2923,6 +2996,7 @@ route("PUT", "/api/patients", async (req, res) => {
   assertRecordClinic(s.user, patient, "المريض");
   for (const k of PATIENT_FIELDS) if (b[k] !== undefined) patient[k] = b[k];
   if (b.phone !== undefined) patient.phoneIdx = phoneIndex(patient.phone); // keep the blind index with the number
+  if (b.consent === true) { patient.consentAt = now(); patient.consentVersion = CONSENT_VERSION; }
   save();
   json(res, 200, patient);
 });
@@ -2942,7 +3016,254 @@ route("DELETE", "/api/patients", async (req, res) => {
   json(res, 200, { success: true, softDeleted: true });
 });
 
+/** Per-patient visit stats incl. the repeated-no-show flag. */
+route("GET", "/api/patients/:id/stats", async (req, res, p) => {
+  const s = requireSession(req);
+  const patient = db.patients.find((x) => x.id === p.id && isLive(x));
+  assertRecordClinic(s.user, patient, "المريض");
+  const appts = db.appointments.filter((a) => a.patientId === patient.id && isLive(a));
+  const by = (st) => appts.filter((a) => a.status === st).length;
+  const cancelled = by("cancelled") + by("canceled");
+  const noShow = by("no-show");
+  json(res, 200, {
+    patientId: patient.id,
+    appointments: appts.length,
+    scheduled: by("scheduled") + by("confirmed"),
+    completed: by("completed"),
+    cancelled, noShow,
+    noShowAlert: noShow >= NO_SHOW_ALERT_AFTER,
+  });
+});
+
+/** Data-portability bundle (law 18-07 access right). Files ship as metadata;
+ * bytes stay behind the download endpoints. Every export is audited. */
+route("GET", "/api/patients/:id/export", async (req, res, p) => {
+  const s = requireSession(req);
+  const patient = db.patients.find((x) => x.id === p.id && isLive(x));
+  assertRecordClinic(s.user, patient, "المريض");
+  const pid = patient.id;
+  const bundle = {
+    exportedAt: now(), patient,
+    appointments: db.appointments.filter((a) => a.patientId === pid && isLive(a)),
+    records: db.records.filter((r) => r.patientId === pid && isLive(r)),
+    prescriptions: db.prescriptions.filter((x) => x.patientId === pid && isLive(x)),
+    invoices: db.invoices.filter((i) => i.patientId === pid && isLive(i)),
+    payments: db.payments.filter((x) => x.clinicId === patient.clinicId &&
+      db.invoices.some((i) => i.id === x.invoiceId && i.patientId === pid)),
+    files: db.patientFiles.filter((f) => f.patientId === pid && isLive(f))
+      .map((f) => ({ id: f.id, filename: f.filename, mime: f.mime, size: f.size, createdAt: f.createdAt })),
+  };
+  audit(req, "patient.export", { detail: pid });
+  json(res, 200, bundle);
+});
+
+/** Erasure / anonymisation (law 18-07). PII is scrubbed, medical files and
+ * prescriptions are destroyed, while invoices/payments survive ANONYMISED
+ * (the finance law keeps the money trail; the name link is gone). Audited. */
+route("POST", "/api/patients/:id/erase", async (req, res, p) => {
+  const s = requireClinicOwner(req);
+  const patient = db.patients.find((x) => x.id === p.id && isLive(x));
+  assertRecordClinic(s.user, patient, "المريض");
+  const pid = patient.id;
+  patient.fullName = `محذوف ${patient.fileNumber || ""}`.trim();
+  patient.phone = ""; patient.phoneIdx = ""; patient.email = "";
+  patient.bloodType = ""; patient.allergies = ""; patient.notes = "";
+  patient.insuranceNumber = ""; patient.insuranceCompany = "";
+  patient.consentAt = null; patient.erasedAt = now();
+  let filesGone = 0, rxGone = 0;
+  db.patientFiles = db.patientFiles.filter((f) => {
+    if (f.patientId !== pid) return true;
+    deletePatientFileBytes(f); filesGone++;
+    return false;
+  });
+  const before = db.prescriptions.length;
+  db.prescriptions = db.prescriptions.filter((x) => x.patientId !== pid);
+  rxGone = before - db.prescriptions.length;
+  save();
+  audit(req, "patient.erase", { detail: `${pid} files:${filesGone} rx:${rxGone}` });
+  json(res, 200, { success: true, patientId: pid, filesRemoved: filesGone, prescriptionsRemoved: rxGone });
+});
+
+/** Retention purge: clinics that configured retentionDays>0 lose live clinical
+ * rows older than the window (appointments/records/prescriptions/files+bytes).
+ * Financial rows (invoices/payments) are NEVER touched here. Returns counts. */
+function purgeRetention(nowMs = Date.now()) {
+  const out = { appointments: 0, records: 0, prescriptions: 0, files: 0 };
+  let changed = false;
+  for (const c of db.clinics) {
+    const days = Math.floor(num(c.retentionDays, 0));
+    if (!(days > 0)) continue;
+    const cutoff = nowMs - days * 864e5;
+    const old = (r) => {
+      const t = Date.parse(r.createdAt) || 0;
+      return t > 0 && t < cutoff;
+    };
+    const myPatients = new Set(db.patients.filter((pt) => pt.clinicId === c.id).map((pt) => pt.id));
+    const inScope = (r) => r.clinicId === c.id || (r.patientId && myPatients.has(r.patientId));
+    for (const [coll, key] of [["appointments", "appointments"], ["records", "records"], ["prescriptions", "prescriptions"]]) {
+      const before = db[coll].length;
+      db[coll] = db[coll].filter((r) => !inScope(r) || !isLive(r) || !old(r));
+      const n = before - db[coll].length;
+      if (n) { out[key] += n; changed = true; }
+    }
+    const fb = db.patientFiles.length;
+    db.patientFiles = db.patientFiles.filter((f) => {
+      if (f.clinicId !== c.id || !isLive(f) || !old(f)) return true;
+      deletePatientFileBytes(f);
+      return false;
+    });
+    if (db.patientFiles.length !== fb) { out.files += fb - db.patientFiles.length; changed = true; }
+  }
+  if (changed) {
+    save();
+    audit(null, "retention.purge", { detail: JSON.stringify(out) });
+  }
+  return out;
+}
+
+/** Manual retention run (owner for own clinic, site owner for all). */
+route("POST", "/api/retention/run", async (req, res) => {
+  const s = requireClinicOwner(req);
+  const out = purgeRetention();
+  audit(req, "retention.run", { detail: JSON.stringify(out) });
+  json(res, 200, { success: true, purged: out });
+});
+
+/* ── PRIVACY (consent, export/erase, retention) ──
+ * Law 18-07 (Algeria): consent is stamped, never implied; every export/erase
+ * is audited; retention purges only what the clinic configured (default: keep).
+ * Policy/terms texts ship as Arabic STARTERS needing legal review.
+ */
+const CONSENT_VERSION = "v1";
+const DEFAULT_PRIVACY_POLICY = "سياسة الخصوصية (نموذج أولي — يتطلب مراجعة قانونية): نجمع الاسم والهاتف وبيانات المواعيد والسجلات الطبية لتقديم الرعاية فقط، ولا نشاركها مع أطراف خارجية دون موافقتك، ويمكنك طلب نسخة من بياناتك أو حذفها من العيادة.";
+const DEFAULT_TERMS = "شروط الاستخدام (نموذج أولي — يتطلب مراجعة قانونية): استخدام الموقع لحجز المواعيد وإدارتها. الحجز لا يغني عن الاستشارة الطبية. بإتمامك الحجز فأنت توافق على استخدام بياناتك للتواصل بشأن موعدك فقط.";
+
+/* ── PATIENT FILES (x-rays, labs, reports) ──
+ * Uploads arrive as base64 inside JSON (no multipart parser needed, still
+ * inside the 5MB body cap). Bytes land under DATA_DIR/files/ with random
+ * names — never the user-supplied name, never under the static root — and
+ * only metadata lives in db.json (so trash/restore/audit keep working).
+ * Serving is session- + clinic-gated with attachment disposition. Backups
+ * snapshot db.json; the files/ directory itself needs a filesystem backup
+ * (see docs/DEPLOY.md cron example which tars the whole DATA_DIR).
+ */
+const FILE_MAX_BYTES = Number(process.env.FILE_MAX_BYTES || 3 * 1024 * 1024);
+const FILE_TYPES = {
+  pdf: { mime: "application/pdf", ext: ".pdf" },
+  png: { mime: "image/png", ext: ".png" },
+  jpg: { mime: "image/jpeg", ext: ".jpg" },
+  webp: { mime: "image/webp", ext: ".webp" },
+};
+const FILE_MIME_TO_KIND = {
+  "application/pdf": "pdf", "image/png": "png",
+  "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp",
+};
+
+function sniffFileKind(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return "pdf"; // %PDF
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
+      buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a) return "png";
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpg";
+  if (buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "webp";
+  return null;
+}
+
+function patientFilePath(row) {
+  return path.join(FILES_DIR, path.basename(row.storedName || ""));
+}
+
+function deletePatientFileBytes(row) {
+  try {
+    const p = patientFilePath(row);
+    if (p.startsWith(FILES_DIR + path.sep) && fs.existsSync(p)) fs.unlinkSync(p);
+  } catch { /* best effort */ }
+}
+
+/** Header-safe download name: ASCII, no quotes/semicolons/control chars. */
+function safeDownloadName(name) {
+  const clean = String(name || "file").replace(/[^\w.\- ]+/g, "_").replace(/\s+/g, " ").trim().slice(0, 100);
+  return clean || "file";
+}
+
+route("POST", "/api/patients/:id/files", async (req, res, p) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const patient = db.patients.find((x) => x.id === p.id && isLive(x));
+  assertRecordClinic(s.user, patient, "المريض");
+  const filename = String(b.filename || "").slice(0, 200);
+  if (!filename) throw badRequest("اسم الملف مطلوب");
+  const kind = FILE_MIME_TO_KIND[String(b.mime || "").toLowerCase()];
+  if (!kind) throw badRequest("نوع الملف غير مسموح (pdf, png, jpg, webp فقط)");
+  let buf;
+  try {
+    buf = Buffer.from(String(b.data || ""), "base64");
+    if (!b.data || buf.length === 0) throw new Error("empty");
+  } catch { throw badRequest("بيانات الملف غير صالحة (base64)"); }
+  if (buf.length > FILE_MAX_BYTES)
+    throw new AppError(413, `حجم الملف يتجاوز الحد (${Math.round(FILE_MAX_BYTES / 1048576)}MB)`);
+  if (sniffFileKind(buf) !== kind) throw badRequest("محتوى الملف لا يطابق النوع المعلن");
+  fs.mkdirSync(FILES_DIR, { recursive: true, mode: 0o700 });
+  const storedName = `f_${crypto.randomBytes(16).toString("hex")}${FILE_TYPES[kind].ext}`;
+  const dest = path.join(FILES_DIR, storedName);
+  fs.writeFileSync(dest, buf, { mode: 0o600 });
+  if (IS_PROD) chmodSafe(dest, 0o600);
+  const row = {
+    id: uid("pfile"), clinicId: patient.clinicId, patientId: patient.id,
+    filename, storedName, mime: FILE_TYPES[kind].mime, size: buf.length,
+    sha256: crypto.createHash("sha256").update(buf).digest("hex"),
+    uploadedBy: s.user.id, createdAt: now(),
+  };
+  db.patientFiles.push(row);
+  save();
+  audit(req, "file.upload", { detail: `${patient.id}:${row.id}:${row.size}` });
+  json(res, 200, { id: row.id, filename, mime: row.mime, size: row.size, createdAt: row.createdAt });
+});
+
+route("GET", "/api/patients/:id/files", async (req, res, p) => {
+  const s = requireSession(req);
+  const patient = db.patients.find((x) => x.id === p.id && isLive(x));
+  assertRecordClinic(s.user, patient, "المريض");
+  json(res, 200, db.patientFiles
+    .filter((f) => f.patientId === patient.id && isLive(f))
+    .map((f) => ({ id: f.id, filename: f.filename, mime: f.mime, size: f.size, createdAt: f.createdAt })));
+});
+
+route("GET", "/api/patients/:id/files/:fileId/download", async (req, res, p) => {
+  const s = requireSession(req);
+  const patient = db.patients.find((x) => x.id === p.id && isLive(x));
+  assertRecordClinic(s.user, patient, "المريض");
+  const row = db.patientFiles.find((f) => f.id === p.fileId && f.patientId === patient.id && isLive(f));
+  if (!row) throw notFound("الملف غير موجود");
+  let bytes;
+  try { bytes = fs.readFileSync(patientFilePath(row)); }
+  catch { throw notFound("الملف غير موجود على القرص"); }
+  audit(req, "file.download", { detail: `${patient.id}:${row.id}` });
+  res.writeHead(200, {
+    "Content-Type": row.mime,
+    "Content-Length": bytes.length,
+    "Content-Disposition": `attachment; filename="${safeDownloadName(row.filename)}"`,
+    "Cache-Control": "no-store",
+  });
+  res.end(bytes);
+});
+
+route("DELETE", "/api/patients/:id/files/:fileId", async (req, res, p) => {
+  const s = requireSession(req);
+  const patient = db.patients.find((x) => x.id === p.id && isLive(x));
+  assertRecordClinic(s.user, patient, "المريض");
+  const row = db.patientFiles.find((f) => f.id === p.fileId && f.patientId === patient.id && isLive(f));
+  if (!row) throw notFound("الملف غير موجود");
+  softDeleteRow(req, row); // bytes stay until purge/restore decides
+  audit(req, "file.delete", { detail: `${patient.id}:${row.id}` });
+  json(res, 200, { success: true, softDeleted: true });
+});
+
 /* ── APPOINTMENTS ── */
+
+/** Closed status vocabulary (UI + API + reports share it). */
+const APPT_STATUSES = ["scheduled", "confirmed", "completed", "cancelled", "canceled", "no-show"];
+const NO_SHOW_ALERT_AFTER = 3; // repeated no-shows that raise the patient flag
 
 /**
  * Half-open overlap test: [start, end) vs [start, end). Two appointments may sit
@@ -3007,10 +3328,61 @@ route("POST", "/api/appointments", async (req, res) => {
     title: b.title || "كشف طبي", type: b.type || "consultation",
     serviceId: b.serviceId || "",
     startTime: start.toISOString(), endTime: end.toISOString(),
-    status: b.status || "scheduled", notes: b.notes || "", createdAt: now(),
+    status: b.status && APPT_STATUSES.includes(b.status) ? b.status : "scheduled",
+    notes: b.notes || "", createdAt: now(),
   };
   db.appointments.push(appt);
   save();
+  json(res, 200, decorateAppointment(appt));
+});
+
+/* Walk-in visit: the patient is standing at the desk. Reuses the patient by
+ * phone index when possible, otherwise registers them, then books the visit
+ * starting NOW with the same server-side clash guard as normal bookings. */
+route("POST", "/api/appointments/walkin", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const clinicId = resolveWriteClinic(s.user, b.clinicId);
+  const wantIdx = phoneIndex(b.phone || "");
+  const idxOf = (p) => (p && p.phoneIdx) || phoneIndex(p && p.phone);
+  let patient = null;
+  if (b.patientId) {
+    patient = db.patients.find((x) => x.id === b.patientId && isLive(x));
+    if (!patient || patient.clinicId !== clinicId) throw badRequest("المريض المحدد غير موجود في هذه العيادة");
+  } else {
+    if (!String(b.fullName || "").trim() && !wantIdx) throw badRequest("اسم المريض أو هاتفه مطلوب");
+    patient = wantIdx
+      ? db.patients.find((p2) => p2.clinicId === clinicId && isLive(p2) && idxOf(p2) === wantIdx)
+      : null;
+    if (!patient) {
+      patient = {
+        id: uid("pat"), clinicId, fileNumber: nextPatientFileNumber(clinicId),
+        fullName: String(b.fullName || "").trim() || "بدون اسم",
+        phone: b.phone || "", phoneIdx: wantIdx, email: b.email || "",
+        gender: b.gender || "", age: b.age === "" || b.age == null ? "" : num(b.age),
+        bloodType: "", allergies: "", insuranceNumber: "", insuranceCompany: "",
+        notes: "", source: "walkin", createdAt: now(),
+      };
+      db.patients.push(patient);
+    }
+  }
+  if (b.doctorId && !db.users.some((u) => u.id === b.doctorId && u.clinicId === clinicId))
+    throw badRequest("الطبيب المحدد غير موجود في هذه العيادة");
+  const durationMin = Math.max(5, num(b.duration, DEFAULT_APPTMENT_MIN));
+  const start = new Date();
+  const end = new Date(start.getTime() + durationMin * 60000);
+  if (appointmentClashes(clinicId, b.doctorId || "", start.getTime(), end.getTime()))
+    throw new AppError(409, "هذا الوقت يتعارض مع موعد موجود للطبيب نفسه");
+  const appt = {
+    id: uid("apt"), clinicId, patientId: patient.id, doctorId: b.doctorId || "",
+    title: b.title || "زيارة بدون موعد", type: "walkin",
+    serviceId: b.serviceId || "",
+    startTime: start.toISOString(), endTime: end.toISOString(),
+    status: "confirmed", notes: b.notes || "", source: "walkin", createdAt: now(),
+  };
+  db.appointments.push(appt);
+  save();
+  audit(req, "appointment.walkin", { detail: `${patient.id}:${appt.id}` });
   json(res, 200, decorateAppointment(appt));
 });
 
@@ -3026,6 +3398,8 @@ route("PUT", "/api/appointments", async (req, res) => {
   if (b.doctorId && !db.users.some((u) => u.id === b.doctorId && u.clinicId === appt.clinicId))
     throw badRequest("الطبيب المحدد غير موجود في هذه العيادة");
   const EDITABLE = ["patientId", "doctorId", "title", "type", "status", "notes", "startTime", "endTime"];
+  if (b.status !== undefined && !APPT_STATUSES.includes(b.status))
+    throw badRequest("حالة الموعد غير صالحة");
   const prev = {};
   for (const k of EDITABLE) prev[k] = appt[k];
   for (const k of EDITABLE) if (b[k] !== undefined) appt[k] = b[k];
@@ -3115,6 +3489,327 @@ route("DELETE", "/api/invoices", async (req, res) => {
   softDeleteRow(req, invoice);
   audit(req, "invoice.delete", { detail: invoice.id });
   json(res, 200, { success: true, softDeleted: true });
+});
+
+/* ── REPORTS ──
+ * Computed from live data on every call (never stored, never trusted from
+ * the client). Clinic-scoped via clinicScope(); invoices carry no doctorId
+ * by design, so revenue breaks down by day + payment method while the
+ * appointments report breaks down by doctor.
+ */
+function reportRange(url) {
+  const t = Date.now();
+  let from = url.searchParams.get("from");
+  let to = url.searchParams.get("to");
+  let fromMs = from ? Date.parse(from) : t - 30 * 864e5;
+  let toMs = to ? Date.parse(to) : t;
+  if (!Number.isFinite(fromMs)) fromMs = t - 30 * 864e5;
+  if (!Number.isFinite(toMs)) toMs = t;
+  if (toMs < fromMs) { const x = fromMs; fromMs = toMs; toMs = x; }
+  if (toMs - fromMs > 366 * 864e5) fromMs = toMs - 366 * 864e5; // cap: 1 year
+  return { fromMs, toMs };
+}
+
+/** CSV-injection guard: values starting with = + - @ get a leading quote. */
+function csvCell(v) {
+  const s = String(v == null ? "" : v);
+  const f = /^[=+\-@]/.test(s) ? `'${s}` : s;
+  return `"${f.replace(/"/g, '""')}"`;
+}
+function sendCsv(res, name, header, rows) {
+  const body = "\uFEFF" + [header, ...rows].map((r) => r.map(csvCell).join(",")).join("\r\n");
+  res.writeHead(200, {
+    "Content-Type": "text/csv; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Content-Disposition": `attachment; filename="${name}"`,
+    "Cache-Control": "no-store",
+  });
+  res.end(body);
+}
+
+function revenueReport(clinicId, fromMs, toMs) {
+  const rows = db.invoices.filter((i) => i.clinicId === clinicId && isLive(i) &&
+    (Date.parse(i.createdAt) || 0) >= fromMs && (Date.parse(i.createdAt) || 0) <= toMs);
+  const total = { invoices: rows.length, total: 0, paid: 0, due: 0, byMethod: {}, byDay: {} };
+  for (const i of rows) {
+    total.total += num(i.total); total.paid += num(i.paidAmount); total.due += num(i.dueAmount);
+    const m = i.paymentMethod || "cash";
+    total.byMethod[m] = total.byMethod[m] || { invoices: 0, total: 0, paid: 0, due: 0 };
+    total.byMethod[m].invoices++;
+    total.byMethod[m].total += num(i.total);
+    total.byMethod[m].paid += num(i.paidAmount);
+    total.byMethod[m].due += num(i.dueAmount);
+    const day = String(i.createdAt || "").slice(0, 10);
+    total.byDay[day] = total.byDay[day] || { invoices: 0, total: 0, paid: 0, due: 0 };
+    total.byDay[day].invoices++;
+    total.byDay[day].total += num(i.total);
+    total.byDay[day].paid += num(i.paidAmount);
+    total.byDay[day].due += num(i.dueAmount);
+  }
+  return total;
+}
+
+function appointmentsReport(clinicId, fromMs, toMs) {
+  const inR = (ms) => ms >= fromMs && ms <= toMs;
+  const rows = db.appointments.filter((a) => a.clinicId === clinicId && isLive(a) && inR(Date.parse(a.startTime) || 0));
+  const byStatus = {}, byDoctor = {};
+  let noShow = 0;
+  for (const a of rows) {
+    const st = APPT_STATUSES.includes(a.status) ? a.status : "scheduled";
+    byStatus[st] = (byStatus[st] || 0) + 1;
+    if (st === "no-show") noShow++;
+    const d = a.doctorId || "";
+    byDoctor[d] = byDoctor[d] || { appointments: 0, noShow: 0 };
+    byDoctor[d].appointments++;
+    if (st === "no-show") byDoctor[d].noShow++;
+  }
+  const doctors = {};
+  for (const [id, v] of Object.entries(byDoctor)) {
+    const u = db.users.find((x) => x.id === id);
+    doctors[id || "unassigned"] = { name: u ? (u.fullName || u.username) : "بدون طبيب", ...v };
+  }
+  return { appointments: rows.length, byStatus, noShowRate: rows.length ? noShow / rows.length : 0, byDoctor: doctors };
+}
+
+function patientsReport(clinicId, fromMs, toMs) {
+  const pats = db.patients.filter((x) => x.clinicId === clinicId && isLive(x));
+  let fresh = 0, returning = 0;
+  const rows = pats.map((p) => {
+    const created = Date.parse(p.createdAt) || 0;
+    const visits = db.appointments.filter((a) => a.patientId === p.id && isLive(a) &&
+      (Date.parse(a.startTime) || 0) >= fromMs && (Date.parse(a.startTime) || 0) <= toMs).length;
+    const isNew = created >= fromMs && created <= toMs;
+    if (isNew) fresh++;
+    else if (visits > 0) returning++;
+    return { id: p.id, fileNumber: p.fileNumber || "", createdAt: p.createdAt || "", isNew, visits };
+  });
+  return { patients: pats.length, new: fresh, returning, rows };
+}
+
+route("GET", "/api/reports/revenue", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة");
+  const { fromMs, toMs } = reportRange(url);
+  json(res, 200, { clinicId, ...revenueReport(clinicId, fromMs, toMs) });
+});
+
+route("GET", "/api/reports/revenue.csv", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة");
+  const { fromMs, toMs } = reportRange(url);
+  const r = revenueReport(clinicId, fromMs, toMs);
+  const rows = Object.entries(r.byDay).sort().map(([day, v]) => [day, v.invoices, v.total, v.paid, v.due]);
+  sendCsv(res, "revenue.csv", ["day", "invoices", "total", "paid", "due"], rows);
+});
+
+route("GET", "/api/reports/appointments", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة");
+  const { fromMs, toMs } = reportRange(url);
+  json(res, 200, { clinicId, ...appointmentsReport(clinicId, fromMs, toMs) });
+});
+
+route("GET", "/api/reports/appointments.csv", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة");
+  const { fromMs, toMs } = reportRange(url);
+  const r = appointmentsReport(clinicId, fromMs, toMs);
+  const rows = Object.entries(r.byDoctor).map(([id, v]) => [v.name, v.appointments, v.noShow]);
+  sendCsv(res, "appointments.csv", ["doctor", "appointments", "no_show"], rows);
+});
+
+route("GET", "/api/reports/patients", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة");
+  const { fromMs, toMs } = reportRange(url);
+  json(res, 200, { clinicId, ...patientsReport(clinicId, fromMs, toMs) });
+});
+
+route("GET", "/api/reports/patients.csv", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة");
+  const { fromMs, toMs } = reportRange(url);
+  const r = patientsReport(clinicId, fromMs, toMs);
+  const rows = r.rows.map((x) => [x.fileNumber, x.createdAt, x.isNew ? "new" : "returning", x.visits]);
+  sendCsv(res, "patients.csv", ["file_number", "created_at", "cohort", "visits_in_range"], rows);
+});
+
+/* ── PAYMENTS ──
+ * Desk payments settle inline (cash/mock-success); remote ones (transfer,
+ * future CIB/SATIM) stay pending until a signed webhook confirms them.
+ * Invoice totals are ALWAYS recomputed server-side; the client only names an
+ * amount. Rows are immutable financial history (no delete endpoint).
+ */
+function applyPaymentToInvoice(inv, amount) {
+  inv.paidAmount = num(inv.paidAmount) + amount;
+  inv.dueAmount = Math.max(0, num(inv.total) - num(inv.paidAmount));
+  inv.status = inv.dueAmount <= 0 ? "paid" : num(inv.paidAmount) > 0 ? "partial" : "pending";
+}
+
+route("POST", "/api/payments", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const provider = payments.get(b.provider);
+  if (!provider) throw badRequest("مزود دفع غير معروف (cash, transfer, mock)");
+  const inv = db.invoices.find((i) => i.id === b.invoiceId && isLive(i));
+  if (!inv) throw notFound("الفاتورة غير موجودة");
+  assertRecordClinic(s.user, inv, "الفاتورة");
+  const amount = num(b.amount);
+  if (!(amount > 0)) throw badRequest("المبلغ يجب أن يكون موجباً");
+  if (amount - num(inv.dueAmount) > 1e-9) throw badRequest("المبلغ يتجاوز المتبقي على الفاتورة");
+  const key = String(b.idempotencyKey || "").slice(0, 100);
+  if (key) {
+    const seen = db.payments.find((x) => x.idempotencyKey === key && x.invoiceId === inv.id);
+    if (seen) { json(res, 200, { ...seen, replay: true }); return; } // safe retry: no second charge
+  }
+  const clinic = clinicOf(inv.clinicId) || {};
+  const intent = await provider.createIntent({
+    amount, currency: inv.currency || clinic.currency || "SAR",
+    invoiceId: inv.id, clinicId: inv.clinicId, config: {},
+  }).catch((e) => { throw new AppError(402, e.message); });
+  const row = {
+    id: uid("pay"), clinicId: inv.clinicId, invoiceId: inv.id, provider: provider.name,
+    amount, currency: inv.currency || clinic.currency || "SAR",
+    status: intent.status, providerRef: intent.id || "", idempotencyKey: key,
+    createdAt: now(), paidAt: intent.status === "paid" ? now() : null,
+  };
+  db.payments.push(row);
+  if (intent.status === "paid") applyPaymentToInvoice(inv, amount);
+  save();
+  audit(req, "payment.create", { detail: `${inv.id}:${row.id}:${row.status}:${amount}` });
+  json(res, 200, row);
+});
+
+route("GET", "/api/payments", async (req, res, p, url) => {
+  requireSession(req);
+  const clinicId = clinicScope(req, url);
+  if (!clinicId) throw badRequest("لا توجد عيادة");
+  const invoiceId = url.searchParams.get("invoiceId");
+  let list = db.payments.filter((x) => x.clinicId === clinicId);
+  if (invoiceId) list = list.filter((x) => x.invoiceId === invoiceId);
+  json(res, 200, list);
+});
+
+/* Unsigned-by-cookie by design: the HMAC signature IS the authentication.
+ * Replays and forgeries without the secret change nothing. */
+route("POST", "/api/payments/webhook", async (req, res) => {
+  const b = await readBody(req);
+  const row = db.payments.find((x) => x.id === b.paymentId);
+  if (!row) throw new AppError(400, "عملية غير معروفة");
+  const provider = payments.get(row.provider);
+  let v;
+  try {
+    v = await provider.verifyWebhook({ body: b, config: {} });
+  } catch {
+    throw new AppError(401, "توقيع غير صالح");
+  }
+  if (v.id !== row.id) throw new AppError(400, "عملية غير معروفة");
+  if (row.status !== "pending") { json(res, 200, { success: true, replay: true }); return; } // exactly-once
+  if (v.status === "paid") {
+    row.status = "paid"; row.paidAt = now();
+    const inv = db.invoices.find((i) => i.id === row.invoiceId && isLive(i));
+    if (inv && inv.clinicId === row.clinicId) applyPaymentToInvoice(inv, row.amount);
+  } else {
+    row.status = "failed";
+  }
+  save();
+  audit(null, "payment.webhook", { detail: `${row.id}:${row.status}` });
+  json(res, 200, { success: true, status: row.status });
+});
+
+/* ── PRINT (HTML print templates) ──
+ * Why HTML and not a hand-rolled PDF: correct Arabic needs glyph shaping +
+ * an embedded font (impossible without libraries, and the project is
+ * zero-dependency). These @page-optimised RTL templates print to PDF from
+ * any browser (Ctrl+P → Save as PDF) with the clinic letterhead. A true
+ * binary-PDF endpoint stays a pending decision (needs a font/shaping lib).
+ */
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function printShell(title, clinic, inner) {
+  return `<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>${escHtml(title)}</title>` +
+    `<style>@page{size:A4;margin:12mm}*{box-sizing:border-box}body{font-family:Tahoma,Arial,sans-serif;color:#111;margin:0}` +
+    `.head{border-bottom:3px double #111;padding-bottom:10px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:flex-end}` +
+    `.head h1{margin:0;font-size:22px}.head small{color:#555}table{width:100%;border-collapse:collapse;margin:10px 0}` +
+    `th,td{border:1px solid #999;padding:6px 8px;text-align:right;font-size:13px}th{background:#f0f0f0}` +
+    `.totals{margin-top:8px;width:280px;margin-right:auto}.row{display:flex;justify-content:space-between;padding:3px 0;font-size:13px}` +
+    `.foot{margin-top:18px;font-size:11px;color:#555;border-top:1px solid #999;padding-top:6px}` +
+    `.nbar{margin:14px 0}button{font-size:15px;padding:8px 22px;cursor:pointer}@media print{.nbar{display:none}}</style></head><body>` +
+    `<div class="head"><div><h1>${escHtml(clinic.name || "عيادة")}</h1><small>${escHtml(clinic.address || "")} — ${escHtml(clinic.phone || "")}</small></div><div><b>${escHtml(title)}</b></div></div>` +
+    inner +
+    `<div class="foot">طُبع من نظام العيادة بتاريخ ${escHtml(now().slice(0, 10))}</div>` +
+    `<div class="nbar"><button onclick="window.print()">طباعة / حفظ PDF</button></div></body></html>`;
+}
+function moneyFmt(n) { return `${Number(n || 0).toLocaleString("en-US")} ر.س`; }
+
+route("GET", "/api/print/invoice/:id", async (req, res, p) => {
+  const s = requireSession(req);
+  const inv = db.invoices.find((i) => i.id === p.id && isLive(i));
+  if (!inv) throw notFound("الفاتورة غير موجودة");
+  assertRecordClinic(s.user, inv, "الفاتورة");
+  const clinic = clinicOf(inv.clinicId) || {};
+  const pat = db.patients.find((x) => x.id === inv.patientId);
+  const items = (Array.isArray(inv.items) ? inv.items : []).map((it, i) =>
+    `<tr><td>${i + 1}</td><td>${escHtml(it.name || it.description || "بند")}</td>` +
+    `<td>${escHtml(it.qty ?? it.quantity ?? 1)}</td><td>${escHtml(moneyFmt(it.price ?? it.amount ?? 0))}</td></tr>`).join("");
+  const inner =
+    `<p><b>المريض:</b> ${escHtml(pat ? pat.fullName : "—")} &nbsp; <b>رقم الملف:</b> ${escHtml(pat ? pat.fileNumber || "" : "")}` +
+    ` &nbsp; <b>التاريخ:</b> ${escHtml(String(inv.createdAt || "").slice(0, 10))} &nbsp; <b>الحالة:</b> ${escHtml(inv.status || "")}</p>` +
+    `<table><tr><th>#</th><th>البيان</th><th>الكمية</th><th>المبلغ</th></tr>${items || '<tr><td colspan="4">لا بنود</td></tr>'}</table>` +
+    `<div class="totals"><div class="row"><span>الإجمالي</span><b>${escHtml(moneyFmt(inv.total))}</b></div>` +
+    `<div class="row"><span>المدفوع</span><b>${escHtml(moneyFmt(inv.paidAmount))}</b></div>` +
+    `<div class="row"><span>المتبقي</span><b>${escHtml(moneyFmt(inv.dueAmount))}</b></div></div>`;
+  audit(req, "print.invoice", { detail: inv.id });
+  respond(res, 200, printShell(`فاتورة ${inv.id}`, clinic, inner), { "Content-Type": `${MIME[".html"]}; charset=utf-8`, "Cache-Control": "no-store" });
+});
+
+route("GET", "/api/print/prescription/:id", async (req, res, p) => {
+  const s = requireSession(req);
+  const rx = db.prescriptions.find((x) => x.id === p.id && isLive(x));
+  if (!rx) throw notFound("الوصفة غير موجودة");
+  ownedPatient(s.user, rx.patientId);
+  const pat = db.patients.find((x) => x.id === rx.patientId);
+  const doc = db.users.find((x) => x.id === rx.doctorId);
+  const clinic = (pat && clinicOf(pat.clinicId)) || {};
+  const items = rx.items.map((it, i) =>
+    `<tr><td>${i + 1}</td><td>${escHtml(it.name)}</td><td>${escHtml(it.dose)}</td>` +
+    `<td>${escHtml(it.duration)}</td><td>${escHtml(it.instructions)}</td></tr>`).join("");
+  const inner =
+    `<p><b>المريض:</b> ${escHtml(pat ? pat.fullName : "—")} &nbsp; <b>الطبيب:</b> ${escHtml(doc ? (doc.fullName || doc.username) : "—")}` +
+    ` &nbsp; <b>التاريخ:</b> ${escHtml(String(rx.createdAt || "").slice(0, 10))}</p>` +
+    `<table><tr><th>#</th><th>الدواء</th><th>الجرعة</th><th>المدة</th><th>تعليمات</th></tr>${items}</table>` +
+    (rx.notes ? `<p><b>ملاحظات:</b> ${escHtml(rx.notes)}</p>` : "");
+  audit(req, "print.prescription", { detail: rx.id });
+  respond(res, 200, printShell("وصفة طبية", clinic, inner), { "Content-Type": `${MIME[".html"]}; charset=utf-8`, "Cache-Control": "no-store" });
+});
+
+route("GET", "/api/print/visit/:id", async (req, res, p) => {
+  const s = requireSession(req);
+  const appt = db.appointments.find((a) => a.id === p.id && isLive(a));
+  if (!appt) throw notFound("الموعد غير موجود");
+  assertRecordClinic(s.user, appt, "الموعد");
+  const clinic = clinicOf(appt.clinicId) || {};
+  const pat = db.patients.find((x) => x.id === appt.patientId);
+  const doc = db.users.find((x) => x.id === appt.doctorId);
+  const rec = db.records.filter((r) => r.patientId === appt.patientId && isLive(r)).slice(-1)[0];
+  const rxs = db.prescriptions.filter((x) => x.patientId === appt.patientId && isLive(x));
+  const inner =
+    `<p><b>المريض:</b> ${escHtml(pat ? `${pat.fullName} (${pat.fileNumber || ""})` : "—")}` +
+    ` &nbsp; <b>الطبيب:</b> ${escHtml(doc ? (doc.fullName || doc.username) : "—")}` +
+    ` &nbsp; <b>الموعد:</b> ${escHtml(String(appt.startTime || "").slice(0, 16).replace("T", " "))} &nbsp; <b>الحالة:</b> ${escHtml(appt.status || "")}</p>` +
+    (rec ? `<h3>السجل الطبي</h3><p><b>الشكوى:</b> ${escHtml(rec.chiefComplaint)}<br><b>التشخيص:</b> ${escHtml(rec.diagnosis)}<br><b>العلاج:</b> ${escHtml(rec.treatment)}<br><b>ملاحظات:</b> ${escHtml(rec.notes)}</p>` : "<p>لا سجل طبي مدخل.</p>") +
+    (rxs.length ? `<h3>الوصفات (${rxs.length})</h3>` + rxs.map((r) =>
+      `<p>${escHtml(String(r.createdAt || "").slice(0, 10))}: ` +
+      r.items.map((it) => escHtml(`${it.name} — ${it.dose}`)).join("، ") + "</p>").join("") : "");
+  audit(req, "print.visit", { detail: appt.id });
+  respond(res, 200, printShell("تقرير زيارة", clinic, inner), { "Content-Type": `${MIME[".html"]}; charset=utf-8`, "Cache-Control": "no-store" });
 });
 
 /* ── USERS ── */
@@ -3334,6 +4029,91 @@ route("DELETE", "/api/records", async (req, res) => {
   ownedPatient(s.user, r.patientId);
   softDeleteRow(req, r);
   audit(req, "record.delete", { detail: r.id });
+  json(res, 200, { success: true, softDeleted: true });
+});
+
+/* ── PRESCRIPTIONS ──
+ * Medication orders linked to patient (+ optional record/visit). Same clinic
+ * isolation as records, soft-delete via the shared trash, content sealed.
+ */
+function cleanRxItems(items) {
+  if (!Array.isArray(items) || !items.length || items.length > 50)
+    throw badRequest("الوصفة تحتاج 1-50 صنفاً");
+  return items.map((it) => {
+    const name = String((it && it.name) || "").trim().slice(0, 120);
+    if (!name) throw badRequest("اسم الدواء مطلوب لكل صنف");
+    return {
+      name,
+      dose: String((it && it.dose) || "").trim().slice(0, 200),
+      duration: String((it && it.duration) || "").trim().slice(0, 200),
+      instructions: String((it && it.instructions) || "").trim().slice(0, 500),
+    };
+  });
+}
+
+function ownedPrescription(user, id) {
+  const rx = db.prescriptions.find((x) => x.id === id && isLive(x));
+  if (!rx) throw notFound("الوصفة غير موجودة");
+  ownedPatient(user, rx.patientId); // throws 403 across clinics
+  return rx;
+}
+
+route("POST", "/api/prescriptions", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  if (!b.patientId) throw badRequest("المريض مطلوب");
+  const patient = ownedPatient(s.user, b.patientId);
+  let recordId = "";
+  if (b.recordId) {
+    const rec = db.records.find((x) => x.id === b.recordId && isLive(x));
+    if (!rec || rec.patientId !== patient.id) throw badRequest("السجل المحدد غير موجود لهذا المريض");
+    recordId = rec.id;
+  }
+  const rx = {
+    id: uid("rx"), clinicId: patient.clinicId, patientId: patient.id, recordId,
+    doctorId: b.doctorId || s.user.id,
+    items: cleanRxItems(b.items), notes: String(b.notes || "").slice(0, 2000),
+    createdAt: now(),
+  };
+  db.prescriptions.push(rx);
+  save();
+  audit(req, "prescription.create", { detail: `${patient.id}:${rx.id}` });
+  json(res, 200, rx);
+});
+
+route("GET", "/api/prescriptions", async (req, res, p, url) => {
+  const s = requireSession(req);
+  const patientId = url.searchParams.get("patientId");
+  let list = db.prescriptions.filter((x) => isLive(x));
+  if (patientId) {
+    ownedPatient(s.user, patientId);
+    list = list.filter((x) => x.patientId === patientId);
+  } else {
+    const ids = new Set(ownedClinicIds(s.user));
+    list = list.filter((x) => ids.has(x.clinicId));
+  }
+  const paged = pagedResponse(url, list, ["notes"]);
+  if (paged) return json(res, 200, paged);
+  json(res, 200, list);
+});
+
+route("PUT", "/api/prescriptions", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const rx = ownedPrescription(s.user, b.id);
+  if (b.items !== undefined) rx.items = cleanRxItems(b.items);
+  if (b.notes !== undefined) rx.notes = String(b.notes).slice(0, 2000);
+  save();
+  audit(req, "prescription.update", { detail: rx.id });
+  json(res, 200, rx);
+});
+
+route("DELETE", "/api/prescriptions", async (req, res) => {
+  const s = requireSession(req);
+  const b = await readBody(req);
+  const rx = ownedPrescription(s.user, b.id);
+  softDeleteRow(req, rx);
+  audit(req, "prescription.delete", { detail: rx.id });
   json(res, 200, { success: true, softDeleted: true });
 });
 
@@ -4094,8 +4874,12 @@ route("POST", "/api/public/booking/:slug", async (req, res, p) => {
       id: uid("pat"), clinicId: clinic.id, fullName: name, gender: b.gender || "",
       age: Math.min(130, Math.max(0, num(b.age, 0))), phone, phoneIdx: wantIdx, email,
       bloodType: "", allergies: "", source: "booking", createdAt: now(),
+      // the public form mandates the consent checkbox before submit
+      consentAt: b.consent === true ? now() : null, consentVersion: b.consent === true ? CONSENT_VERSION : "",
     };
     db.patients.push(patient);
+  } else if (b.consent === true && !patient.consentAt) {
+    patient.consentAt = now(); patient.consentVersion = CONSENT_VERSION;
   }
 
   const start = new Date(`${date}T${time}:00`);
@@ -4472,6 +5256,15 @@ function assertRequestSafe(req) {
 
 async function handle(req, res) {
   req.cspNonce = crypto.randomBytes(16).toString("base64"); // per-response CSP nonce
+  const m0 = Date.now();
+  METRICS.requests++;
+  let mDone = false;
+  res.on("finish", () => {
+    if (mDone) return; mDone = true;
+    METRICS.latencyMs += Date.now() - m0;
+    if (res.statusCode >= 500) METRICS.errors5xx++;
+    else if (res.statusCode >= 400) METRICS.errors4xx++;
+  });
   cors(req, res);
 
   if (req.method === "OPTIONS") {
@@ -4660,6 +5453,9 @@ const sweeper = setInterval(() => {
     }
     const purged = purgeExpiredTrash();
     if (purged) log(`purged ${purged} trashed row(s) past the ${Math.round(LIMITS.trashTtlMs / 86400000)}-day window`);
+    const retained = purgeRetention();
+    const retainedN = Object.values(retained).reduce((a, b) => a + b, 0);
+    if (retainedN) log(`retention purge removed ${retainedN} row(s): ${JSON.stringify(retained)}`);
     const staleResets = pruneResets();
     if (staleResets) saveResets();
     pruneRateBuckets();
@@ -4768,6 +5564,18 @@ if (RESTORE_FILE) {
   process.exit(verifyBackupCli(argOf("verify-backup")) ? 0 : 1);
 } else if (ROTATE_KEY) {
   rotateKeyCli().then((ok) => process.exit(ok ? 0 : 1));
+} else if (ROTATE_SESSIONS) {
+  // Incident response: kill every live session now (forces re-login for all).
+  loadSessions();
+  const n = Object.keys(sessions).length;
+  sessions = {};
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(SESSIONS_FILE, "{}", "utf8");
+    if (IS_PROD) chmodSafe(SESSIONS_FILE, 0o600);
+  } catch (e) { fail("could not clear sessions:", e.message); process.exit(1); }
+  log(`--rotate-sessions: revoked ${n} session(s). All users must sign in again.`);
+  process.exit(0);
 } else {
   startupChecks();
   load();
