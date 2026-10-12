@@ -177,7 +177,9 @@ async function waitHealthy(tries = 60) {
   check("restored patient is back in the list", listRestored.json.items.some((p) => p.id === pid));
 
   // appointment + task + service + inventory + record soft deletes
-  const appt = await req("POST", "/api/appointments", { token: A, body: { patientId: pid, title: "موعد للحذف" } });
+  // (fixed far-future start so it never collides with the seeded demo slots)
+  const farFuture = new Date(Date.now() + 45 * 864e5).toISOString();
+  const appt = await req("POST", "/api/appointments", { token: A, body: { patientId: pid, title: "موعد للحذف", startTime: farFuture } });
   const delAppt = await req("DELETE", "/api/appointments", { token: A, body: { id: appt.json.id } });
   const apptsAfter = await req("GET", "/api/appointments", { token: A });
   check("deleted appointment is hidden", delAppt.status === 200 && !apptsAfter.json.some((a) => a.id === appt.json.id));
