@@ -2,6 +2,8 @@
 
 نظام متكامل لإدارة العيادات والمواعيد والمرضى والفواتير، مع **صفحة حجز عامة** لكل عيادة. يعمل بسيرفر Node بدون أي اعتماديات خارجية (Zero dependencies) وواجهة عميل مبنية مسبقاً (Next.js static export).
 
+> 📜 الرخصة: [MIT](LICENSE) — والمساهمة مفتوحة وفق [CONTRIBUTING.md](CONTRIBUTING.md) و[مدونة السلوك](CODE_OF_CONDUCT.md).
+
 > 📸 **الشرح التفصيلي لكل شاشة:** [docs/SCREENS.md](docs/SCREENS.md)
 
 ---
@@ -174,18 +176,38 @@ npm run test:all  # كل المجموعات، بما فيها واجهات ال�
 
 يدعم رابط الإدارة `…/<slug>?manage=<token>` للتأجيل/الإلغاء، ومربّع موافقة إلزامي قبل التأكيد.
 
+## 🤝 المساهمة والتوثيق
+
+| الملف | الغرض |
+|---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | دليل المساهمة (Issues، PRs، المعايير، الاختبارات) |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | مدونة السلوك (Contributor Covenant v2.1) |
+| [SECURITY.md](SECURITY.md) | النموذج الأمني + الإبلاغ الخاص عن الثغرات |
+| [CHANGELOG.md](CHANGELOG.md) | سجل التغييرات (Keep a Changelog) |
+| [ROADMAP.md](ROADMAP.md) | خارطة الطريق والقرارات المعلّقة |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | المعمارية وتدفق البيانات ونموذجها |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | قائمة تحقق النشر الإنتاجي |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | دليل النشر التفصيلي خطوة بخطوة |
+| [docs/FRONTEND.md](docs/FRONTEND.md) | وضع الواجهة المبنية وخطة مصدرها |
+| [docs/WHATSAPP.md](docs/WHATSAPP.md) | إعداد WhatsApp Cloud API |
+| [docs/INCIDENT.md](docs/INCIDENT.md) | الاستجابة لتسريب البيانات |
+| [LICENSE](LICENSE) | رخصة MIT |
+
+CI يعمل على كل دفع (`Node 20 و22`): [ci.yml](.github/workflows/ci.yml).
+
 ## 📂 البنية
 
 ```
 server.js            الخادم + واجهات API + تقديم الملفات الثابتة
 booking-page.js      مُنشئ صفحة الحجز العامة المستقلة
-notifiers/           تجريد الإرسال (console للتطوير، واتساب كلاود، ويب هوك موقّع، SMTP واجهة)
-scripts/             أدوات النسخ الاحتياطي والاستعادة (backup.js، restore.js)
+notifiers/           الإرسال (console، واتساب كلاود حقيقي، ويب هوك موقّع، SMTP حقيقي)
+payments/            تجريد الدفع (نقدي/تحويل/mock + webhook-HMAC)
+scripts/             أدوات النسخ الاحتياطي والاستعادة (backup.js، restore.js) + فحص الصياغة
 index.html           هيكل عميل لوحة التحكم
-_next/               ملفات الواجهة المبنية (JS/CSS/الخطوط)
-tests/               مجموعات الاختبار + مشغّل run-suite + أداة CDP
+_next/               ملفات الواجهة المبنية (JS/CSS/الخطوط) — بلا مصدر، راجع docs/FRONTEND.md
+tests/               ~29 مجموعة اختبار + مشغّل run-suite + أداة CDP
 tools/               أدوات تطوير (ترقيع الحزمة، تحقق)
-docs/                الشرح + صور الشاشات
+docs/                الشرح + صور الشاشات + أدلة النشر والمعمارية
 data/                قاعدة البيانات والسجلات (تُنشأ تلقائياً، غير مُضمّنة)
 package.json         سكربتات التشغيل والاختبار
 SECURITY.md          النموذج الأمني ومتغيّرات البيئة

@@ -2,6 +2,7 @@
   "name": "eyada-clinic",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "description": "نظام عيادة — zero-dependency clinic management server + static Next.js export",
   "type": "commonjs",
   "engines": {

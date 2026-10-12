@@ -38,3 +38,14 @@ _next/static/chunks/*.orig2
 node_modules/
 .DS_Store
 Thumbs.db
+
+# secrets: never commit a filled env file (only .env.example is tracked)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# test coverage / packaging leftovers
+coverage/
+npm-debug.log*
+*.tgz
