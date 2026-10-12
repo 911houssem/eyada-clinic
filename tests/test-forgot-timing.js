@@ -82,13 +82,13 @@ async function waitHealthy(tries = 60) {
   if (!(await waitHealthy())) { console.log("server never became healthy:\n" + srvOut); finish(1); return; }
 
   // warm up JIT + sockets so the measurement sees steady state
-  for (let i = 0; i < 3; i++) { await postForgot("admin"); await postForgot("nobody-here-xyz"); }
+  for (let i = 0; i < 3; i++) { await postForgot("houssem"); await postForgot("nobody-here-xyz"); }
 
   // interleave to cancel out any slow drift of the machine
   const known = [], unknown = [];
   let knownMsg = "", unknownMsg = "", knownStatus = 0, unknownStatus = 0;
   for (let i = 0; i < N; i++) {
-    const k = await postForgot("admin");
+    const k = await postForgot("houssem");
     const u = await postForgot("nobody-here-xyz");
     known.push(k.ms); unknown.push(u.ms);
     knownMsg = k.json && k.json.message; unknownMsg = u.json && u.json.message;

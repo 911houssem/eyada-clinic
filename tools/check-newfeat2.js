@@ -84,7 +84,7 @@ const login = async (u, p) => {
   ok(cheat.status === 403, 'POST /api/clinic-subscriptions -> 403', cheat);
 
   head('5. site owner activates the plan, then hiring works with permissions');
-  const ownerTok = (await login('admin', 'admin123')).token;
+  const ownerTok = (await login('houssem', 'houssem123')).token;
   const act = await api('/api/clinic-subscriptions', {
     method: 'POST', token: ownerTok,
     body: { clinicId, planId: '', status: 'active', endDate: new Date(Date.now() + 30 * 864e5).toISOString() },

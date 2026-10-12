@@ -47,7 +47,7 @@ async function login(username, passwords) {
 (async () => {
   const db = JSON.parse(fs.readFileSync(DB, "utf8"));
   const owner = db.users.find((u) => u.role === "super_admin");
-  const ownerTok = await login(owner.username, ["admin123", "123456", "admin"]);
+  const ownerTok = await login(owner.username, ["houssem123", "123456", "admin"]);
   check("site owner session", !!ownerTok, owner.username);
   if (!ownerTok) return done();
   const oc = "eyada_session=" + ownerTok;
@@ -105,7 +105,7 @@ async function login(username, passwords) {
   check("API accepts it again", ap2.code === 200, "code=" + ap2.code);
 
   // 4. support cannot rewrite the map
-  const supTok = await login("support", ["support", "admin123", "123456"]);
+  const supTok = await login("support", ["support", "houssem123", "123456"]);
   if (supTok) {
     const s403 = await req("PUT", `/api/clinic-subscriptions/${clinic.id}`, { modules: { appointments: false } },
       "eyada_session=" + supTok);

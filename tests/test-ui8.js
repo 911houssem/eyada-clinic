@@ -57,7 +57,7 @@ async function login(username, passwords) {
     /* ── 1. clinic owner ── */
     const ownerRow = db.users.find((u) => u.clinicId === db.clinics[0].id && u.role === "admin")
       || db.users.find((u) => u.role === "super_admin");
-    const ownerToken = await login(ownerRow.username, ["123456", "admin123", "admin"]);
+    const ownerToken = await login(ownerRow.username, ["123456", "houssem123", "admin"]);
     check("owner session token obtained", !!ownerToken, "user=" + ownerRow.username);
     console.log("  debug token len=" + ownerToken.length + " sample=" + JSON.stringify(ownerToken.slice(0, 12)));
 
@@ -233,7 +233,7 @@ async function login(username, passwords) {
     });
     const cid = J(reg).user && J(reg).user.clinicId;
     await settle();
-    const siteToken = await login(db.users.find((u) => u.role === "super_admin").username, ["123456", "admin123"]);
+    const siteToken = await login(db.users.find((u) => u.role === "super_admin").username, ["123456", "houssem123"]);
     const siteCookie = siteToken ? "eyada_session=" + siteToken : "";
     const probeCookie = ck(reg);
     const probeToken = (probeCookie.match(/eyada_session=([A-Za-z0-9_-]+)/) || [])[1];

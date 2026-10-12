@@ -106,7 +106,7 @@ const newestBackup = () => {
   };
   if (!(await waitHealthy())) { console.log("server never became healthy:\n" + srv._out()); finish(1); return; }
 
-  const login = await req("POST", "/api/auth/login", { body: { username: "admin", password: "admin123" } });
+  const login = await req("POST", "/api/auth/login", { body: { username: "houssem", password: "houssem123" } });
   const sc = (login.headers?.["set-cookie"] || []).map((c) => c.split(";")[0]).join("; ");
   check("seeded owner signs in", login.status === 200 && !!sc, `code=${login.status}`);
   if (!sc) { finish(1); return; }

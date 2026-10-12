@@ -303,7 +303,7 @@ function futureDate(daysAhead = 30) {
   // the same pattern the other suites use.
   const siteUser = JSON.parse(fs.readFileSync(DB, "utf8")).users.find((x) => x.role === "super_admin");
   let siteCookie = "";
-  for (const pw of ["123456", "admin123", "admin", "12345678", siteUser.username]) {
+  for (const pw of ["123456", "houssem123", "admin", "12345678", siteUser.username]) {
     const l = await req("POST", "/api/auth/login", { username: siteUser.username, password: pw });
     if (J(l).user) { siteCookie = ck(l); break; }
   }

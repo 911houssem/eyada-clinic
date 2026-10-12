@@ -39,7 +39,7 @@ const reload = () => JSON.parse(fs.readFileSync(DB, "utf8"));
   const site = db.users.find((u) => u.role === "super_admin");
 
   let sc = "";
-  for (const pw of ["123456", "admin123", "admin"]) {
+  for (const pw of ["123456", "houssem123", "admin"]) {
     const l = await req("POST", "/api/auth/login", { username: site.username, password: pw });
     if (J(l).user) { sc = ck(l); break; }
   }
@@ -177,13 +177,13 @@ const reload = () => JSON.parse(fs.readFileSync(DB, "utf8"));
   // clinic admin. A leftover clinic-owner from an earlier run must not shadow it
   // (that is exactly what made this probe fail on a dirty database).
   const candidates = [
-    db.users.find((u) => u.username === "admin"),
+    db.users.find((u) => u.username === "houssem"),
     db.users.find((u) => u.role === "super_admin"),
     db.users.find((u) => u.clinicId === db.clinics[0].id && u.role === "admin"),
   ].filter(Boolean);
   let oc = "", ocName = "";
   for (const row of candidates) {
-    for (const pw of ["admin123", "123456", "admin"]) {
+    for (const pw of ["houssem123", "123456", "admin"]) {
       const l = await req("POST", "/api/auth/login", { username: row.username, password: pw });
       if (J(l).user) { oc = ck(l); ocName = row.username; break; }
     }

@@ -100,7 +100,7 @@ node scripts/restore.js --verify <file>   # نفس الأمر دون تشغيل 
 
 | الدور | اسم المستخدم | كلمة المرور |
 |------|-------------|-------------|
-| المالك (super_admin) | `admin` | `admin123` |
+| المالك (super_admin) | `houssem` | `houssem123` |
 | طبيب | `doctor` | `doctor123` |
 | استقبال | `reception` | `reception123` |
 

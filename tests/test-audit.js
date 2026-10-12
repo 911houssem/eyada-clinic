@@ -74,7 +74,7 @@ const auditFile = () => path.join(TMP, "audit.log");
   };
   if (!(await waitHealthy())) { console.log("server never became healthy:\n" + srvOut); finish(1); return; }
 
-  const login = await req("POST", "/api/auth/login", { body: { username: "admin", password: "admin123" } });
+  const login = await req("POST", "/api/auth/login", { body: { username: "houssem", password: "houssem123" } });
   const A = cookieOf(login);
   await req("POST", "/api/patients", { cookie: A, body: { fullName: "Audit Probe", phone: "0555000701" } });
   srv.kill("SIGKILL");

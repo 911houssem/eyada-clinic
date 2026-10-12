@@ -72,7 +72,7 @@ const NOTE = "أول زيارة";
   const selfSub = await req("POST", "/api/clinic-subscriptions", { clinicId: createdClinics[0], status: "active" }, ownerCookie);
   check("clinic owner cannot self-activate a paid plan", selfSub.code === 403, `code=${selfSub.code}`);
 
-  const siteOwner = await login("admin", "admin123");
+  const siteOwner = await login("houssem", "houssem123");
   check("site owner login still works", siteOwner.code === 200 && J(siteOwner).user.role === "super_admin");
   const pay = await req("POST", "/api/clinic-subscriptions",
     { clinicId: createdClinics[0], status: "active", endDate: new Date(Date.now() + 30 * 864e5).toISOString() }, siteOwner.cookie);

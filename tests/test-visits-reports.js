@@ -74,7 +74,7 @@ const cookieOf = (r) => (r.headers?.["set-cookie"] || []).map((c) => c.split(";"
   };
   if (!(await waitHealthy())) { console.log("server never became healthy:\n" + srvOut); finish(1); return; }
 
-  const login = await req("POST", "/api/auth/login", { body: { username: "admin", password: "admin123" } });
+  const login = await req("POST", "/api/auth/login", { body: { username: "houssem", password: "houssem123" } });
   const A = cookieOf(login);
   check("seeded owner signs in", login.status === 200 && !!A, `code=${login.status}`);
 

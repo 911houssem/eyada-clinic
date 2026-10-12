@@ -12,7 +12,7 @@ const DB = "C:\\Users\\911ho\\OneDrive\\Desktop\\clinic\\eyada-clinic-main\\data
 // every suite prefixes its throwaway accounts so cleanup can find them safely
 const PROBE = /^(sv|sw|ta|tb|zz|doc\d*|probe|pwtest|staffprobe|diag|lock|st)[a-z0-9]*$/i;
 // seeded demo accounts that must survive
-const KEEP = new Set(["admin", "support", "doctor", "reception"]);
+const KEEP = new Set(["houssem", "admin", "support", "doctor", "reception"]);
 // clinic names created by the probe/diag/ui suites; migrate() prunes them on boot
 const PROBE_CLINIC = /^(clinic-(sv|sw|ta|tb|zz)|probe clinic|subprobe|lock ?probe|locked ui|diag\b)/i;
 
@@ -46,7 +46,7 @@ const ck = (r) => (r.cookie || []).map((x) => x.split(";")[0]).join("; ");
   if (!site) { console.log("  FAIL  no super_admin in the db"); process.exit(1); }
 
   let cookie = "";
-  for (const pw of ["123456", "admin123", "admin", "12345678", site.username]) {
+  for (const pw of ["123456", "houssem123", "admin", "12345678", site.username]) {
     const l = await req("POST", "/api/auth/login", { username: site.username, password: pw });
     if (J(l).user) { cookie = ck(l); break; }
   }

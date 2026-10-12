@@ -51,13 +51,13 @@ const mins = (t) => Number(t.slice(11, 13)) * 60 + Number(t.slice(14, 16));
   const db = JSON.parse(fs.readFileSync(DB, "utf8"));
   const clinic = db.clinics.find((c) => c.name && c.name.includes("النور")) || db.clinics[0];
   const ownerCandidates = [
-    db.users.find((u) => u.username === "admin"),
+    db.users.find((u) => u.username === "houssem"),
     db.users.find((u) => u.role === "super_admin"),
     db.users.find((u) => u.clinicId === clinic.id && u.role === "admin"),
   ].filter(Boolean);
   let ownerToken = "", ownerName = "";
   for (const row of ownerCandidates) {
-    const t = await login(row.username, ["admin123", "123456", "admin"]);
+    const t = await login(row.username, ["houssem123", "123456", "admin"]);
     if (t) { ownerToken = t; ownerName = row.username; break; }
   }
   check("owner session token obtained", !!ownerToken, "user=" + ownerName + " clinic=" + clinic.name);

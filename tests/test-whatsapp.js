@@ -136,7 +136,7 @@ async function waitHealthy(tries = 60) {
   };
   if (!(await waitHealthy())) { console.log("server never became healthy:\n" + srvOut); finish(1); return; }
 
-  const login = await req("POST", "/api/auth/login", { body: { username: "admin", password: "admin123" } });
+  const login = await req("POST", "/api/auth/login", { body: { username: "houssem", password: "houssem123" } });
   const ac = (login.headers?.["set-cookie"] || []).map((c) => c.split(";")[0]).join("; ");
   check("seeded owner signs in", login.status === 200 && !!ac, `code=${login.status}`);
 

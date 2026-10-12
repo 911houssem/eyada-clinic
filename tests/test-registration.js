@@ -94,7 +94,7 @@ async function withServer(env, fn) {
     const badCode = await req("POST", "/api/auth/register", { body: { ...regBody(U("invX")), inviteCode: "INV-NOPE" } });
     check("invite: bogus code is refused (403)", badCode.status === 403, `code=${badCode.status}`);
 
-    const admin = await req("POST", "/api/auth/login", { body: { username: "admin", password: "admin123" } });
+    const admin = await req("POST", "/api/auth/login", { body: { username: "houssem", password: "houssem123" } });
     const ac = cookieOf(admin);
     check("site owner signs in", admin.status === 200 && !!ac, `code=${admin.status}`);
     const mk = await req("POST", "/api/invites", { cookie: ac, body: {} });
@@ -118,7 +118,7 @@ async function withServer(env, fn) {
     console.log("  .. mode=closed");
     const r = await req("POST", "/api/auth/register", { body: regBody(U("clo1")) });
     check("closed: registration refused (403)", r.status === 403, `code=${r.status}`);
-    const login = await req("POST", "/api/auth/login", { body: { username: "admin", password: "admin123" } });
+    const login = await req("POST", "/api/auth/login", { body: { username: "houssem", password: "houssem123" } });
     check("closed: login still works", login.status === 200, `code=${login.status}`);
   });
 

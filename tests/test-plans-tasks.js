@@ -57,7 +57,7 @@ const uniq = () => Math.random().toString(36).slice(2, 8);
   if (!siteCookie || J(siteLogin).error) {
     // fall back: read the stored hash target from db if the default password differs
     console.log("  ..   site owner login needs a known password, trying common defaults");
-    for (const pw of ["admin", "admin123", "123456", "12345678", siteUser.username]) {
+    for (const pw of ["admin", "houssem123", "123456", "12345678", siteUser.username]) {
       const l = await req("POST", "/api/auth/login", { username: siteUser.username, password: pw });
       if (J(l).user) { siteCookie = ck(l); console.log("       site owner password = " + pw); break; }
     }

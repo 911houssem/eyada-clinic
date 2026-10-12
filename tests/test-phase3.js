@@ -126,7 +126,7 @@ const ofTemplate = (key) => received.filter((x) => x.json && x.json.templateKey 
   }
 
   /* ── login ── */
-  const owner = await req("POST", "/api/auth/login", { body: { username: "admin", password: "admin123" } });
+  const owner = await req("POST", "/api/auth/login", { body: { username: "houssem", password: "houssem123" } });
   const staff = await req("POST", "/api/auth/login", { body: { username: "reception", password: "reception123" } });
   const A = owner.token, R = staff.token;
   check("owner + receptionist can sign in", owner.status === 200 && !!A && staff.status === 200 && !!R);

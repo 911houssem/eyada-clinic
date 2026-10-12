@@ -50,7 +50,7 @@ const screen = (page) => page.eval(`document.body.innerText`);
 (async () => {
   const db = JSON.parse(fs.readFileSync(DB, "utf8"));
   const ownerRow = db.users.find((u) => u.role === "super_admin");
-  const ownerToken = await login(ownerRow.username, ["admin123", "123456", "admin"]);
+  const ownerToken = await login(ownerRow.username, ["houssem123", "123456", "admin"]);
   check("site owner session", !!ownerToken, ownerRow.username);
   if (!ownerToken) return done();
   const oc = "eyada_session=" + ownerToken;

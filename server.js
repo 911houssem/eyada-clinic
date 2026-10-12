@@ -787,7 +787,7 @@ function seed() {
   });
 
   const users = [
-    mkUser("admin", "admin123", "مالك العيادة", "0500000000", "admin@eyada.local", "super_admin"),
+    mkUser("houssem", "houssem123", "مالك العيادة", "0500000000", "admin@eyada.local", "super_admin"),
     mkUser("doctor", "doctor123", "د. أحمد المنصور", "0500000001", "doctor@eyada.local", "doctor"),
     mkUser("reception", "reception123", "أ. سارة العتيبي", "0500000002", "reception@eyada.local", "reception"),
     // helpdesk — the only account a clinic may open a conversation with
@@ -1368,7 +1368,7 @@ function revokeTrustedDevices(req, res, user) {
 // the existing test accounts keep working.
 const COMMON_PASSWORDS = new Set([
   "123456", "12345678", "123456789", "1234567890", "password", "password1",
-  "qwerty", "qwerty123", "111111", "000000", "admin", "admin123", "administrator",
+  "qwerty", "qwerty123", "111111", "000000", "admin", "admin123", "administrator", "houssem", "houssem123",
   "letmein", "welcome", "iloveyou", "monkey", "dragon", "abc123", "sunshine",
   "princess", "football", "baseball", "master", "login", "passw0rd", "test1234",
   "aaaaaaaa", "a1234567", "changeme", "default",
@@ -5618,7 +5618,7 @@ function banner(actualPort) {
   const creds = IS_PROD
     ? "     الإنتاج     لا حسابات تجريبية — أنشئ المالك عبر OWNER_* أو --create-owner"
     : `     حسابات تجريبية:
-       admin      / admin123       مدير عام
+       houssem    / houssem123  مدير عام
        doctor     / doctor123      طبيب
        reception  / reception123   استقبال`;
   console.log(`

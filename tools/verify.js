@@ -101,13 +101,13 @@ function req(method, p, body, cookie) {
   c.kill("SIGKILL"); await sleep(400);
 
   console.log("\n═══ 4. AUTH STILL WORKS ═══");
-  const login = await req("POST", "/api/auth/login", { username: "admin", password: "admin123" });
+  const login = await req("POST", "/api/auth/login", { username: "houssem", password: "houssem123" });
   const cookie = (login.cookie || []).map((x) => x.split(";")[0]).join("; ");
   check("login 200", login.code === 200, login.body.slice(0, 70));
   check("session cookie issued", /eyada_session=/.test(cookie));
   const me = await req("GET", "/api/auth/me", null, cookie);
   check("/api/auth/me 200", me.code === 200 && me.body.includes("مالك العيادة"));
-  const bad = await req("POST", "/api/auth/login", { username: "admin", password: "wrong" });
+  const bad = await req("POST", "/api/auth/login", { username: "houssem", password: "wrong" });
   check("bad password → 401 not 500", bad.code === 401, `code=${bad.code}`);
   const uname = "probe_" + Date.now().toString(36);
   const reg = await req("POST", "/api/auth/register", { username: uname, password: "secret123", fullName: "د. اختبار", clinicName: "عيادة الاختبار" });
@@ -164,7 +164,7 @@ function req(method, p, body, cookie) {
     ["missing asset", () => new Promise((r) => http.get({ port: PORT, path: "/_next/static/chunks/GONE.js" }, (x) => { x.resume(); x.on("end", r); }).on("error", r))],
     ["SPA deep route", () => new Promise((r) => http.get({ port: PORT, path: "/settings/profile/x" }, (x) => { x.resume(); x.on("end", r); }).on("error", r))],
     ["60 parallel requests", async () => { await Promise.all(Array.from({ length: 60 }, () => new Promise((r) => http.get({ port: PORT, path: "/" }, (x) => { x.resume(); x.on("end", r); }).on("error", r)))); }],
-    ["30 logins (session growth)", async () => { for (let i = 0; i < 30; i++) await req("POST", "/api/auth/login", { username: "admin", password: "admin123" }); }],
+    ["30 logins (session growth)", async () => { for (let i = 0; i < 30; i++) await req("POST", "/api/auth/login", { username: "houssem", password: "houssem123" }); }],
   ];
   for (const [name, fn] of probes) {
     await fn().catch(() => {});
@@ -175,7 +175,7 @@ function req(method, p, body, cookie) {
 
   console.log("\n═══ 7. LEAK / RESOURCE GUARDS ═══");
   const before = process.memoryUsage;
-  await req("POST", "/api/auth/login", { username: "admin", password: "x".repeat(6 * 1024 * 1024) });
+  await req("POST", "/api/auth/login", { username: "houssem", password: "x".repeat(6 * 1024 * 1024) });
   await sleep(600);
   check("6MB body rejected without crashing", (await alive()).up);
   const mem = JSON.parse((await alive()).b || "{}");
