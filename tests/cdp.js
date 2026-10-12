@@ -44,15 +44,16 @@ async function launch({ port = 9333, width = 1440, height = 1000 } = {}) {
   const proc = spawn(CHROME, [
     "--headless=new", "--disable-gpu", "--no-sandbox", "--hide-scrollbars",
     "--no-first-run", "--no-default-browser-check", "--disable-extensions",
+    "--disable-dev-shm-usage", // CI containers have tiny /dev/shm; use /tmp instead
     `--remote-debugging-port=${port}`,
     `--user-data-dir=${profile}`,
     `--window-size=${width},${height}`,
     "about:blank",
   ], { stdio: "ignore" });
 
-  // wait for the debugger to come up
+  // wait for the debugger to come up (loaded CI runners can be slow)
   let info = null;
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 120; i++) {
     try { info = JSON.parse(await get(`http://127.0.0.1:${port}/json/version`)); break; }
     catch { await sleep(250); }
   }
