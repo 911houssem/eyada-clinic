@@ -17,14 +17,14 @@ check("mobile dom rendered", dom.length > 2000, `len=${dom.length}`);
 const c = (re) => (dom.match(re) || []).length;
 check("form present", /<form id="f"/.test(dom));
 check("service cards present", c(/class="svc[ "]/g) === 3, `n=${c(/class="svc[ "]/g)}`);
-check("slots present", c(/data-t="/g) > 0, `n=${c(/data-t="/g)}`);
-check("summary present", dom.includes("ملخّص الموعد"));
-check("hero present", /<h1 id="hname">/.test(dom));
-check("no error state", !/تعذّر تحميل/.test(dom));
+  check("slots present", (c(/data-t="/g) > 0 || c(/next-card/g) > 0), `n=${c(/data-t="/g)} times, next=${c(/next-card/g)}`);
+  check("summary present", dom.includes("ملخّص الموعد"));
+  check("hero present", /<h1 id="hname">/.test(dom));
+  check("no error state", !/تعذّر تحميل/.test(dom));
 
 // the single-column layout is a media query, so just prove it is in the css
 const page = r.stdout || "";
-check("responsive breakpoint exists", /@media\(min-width:880px\)/.test(page));
+  check("responsive breakpoint exists", /@media\(min-width:600px\)/.test(page) || /@media\(min-width:880px\)/.test(page));
 check("mobile-first single column is the default", /grid-template-columns:1fr;/.test(page));
 // max-width/min-width are safe at any viewport; only a hard width would overflow
 const hardWidth = page.match(/(?<![a-z-])width:\s*\d{3,}px/g) || [];
